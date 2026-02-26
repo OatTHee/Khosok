@@ -242,11 +242,21 @@ async function getLeaderboardEmbed() {
 // โซนรับคำสั่งจากการพิมพ์ (Message Commands)
 // =========================================================
 client.on('messageCreate', async message => {
-    if (!message.member || !message.member.permissions.has('ManageMessages')) return;
+    // ดักไว้แค่ว่าต้องเป็นข้อความจากคนในเซิร์ฟเวอร์ และไม่ใช่บอทพิมพ์เอง
+    if (!message.member || message.author.bot) return; 
 
     const args = message.content.split(' ');
     const command = args[0];
     const tournamentId = args[1];
+
+    // 🔒 ระบบป้องกัน: เช็กสิทธิ์เฉพาะคำสั่งของแอดมิน
+    const adminCommands = ['!help', '!setup', '!current', '!standing', '!rank'];
+    if (adminCommands.includes(command)) {
+        if (!message.member.permissions.has('ManageMessages')) {
+            // ถ้าไม่ใช่แอดมินพิมพ์คำสั่งพวกนี้ ให้บอทเงียบและเมินไปเลย
+            return; 
+        }
+    }
 
     if (command === '!help') {
         const helpEmbed = new EmbedBuilder()
