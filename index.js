@@ -1,7 +1,11 @@
+
+
 const express = require('express');
 const app = express();
 app.get('/', (req, res) => res.send('Khosok is Online! 🟢'));
-app.listen(process.env.PORT || 3000, () => console.log('เซิร์ฟเวอร์จำลองเริ่มทำงานแล้ว'));
+app.listen(process.env.PORT || 3000,, '0.0.0.0', () => {
+    console.log('เซิร์ฟเวอร์จำลองเริ่มทำงานแล้ว พร้อมรับการปลุก!');
+});
 
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
 const axios = require('axios');
@@ -9,8 +13,8 @@ const tournamentTimers = new Map(); // หน่วยความจำสำ�
 const activePolls = new Map();
 
 // กำหนดค่าต่างๆ ของคุณที่นี่
-const DISCORD_TOKEN = 'MTQ3NjA2OTUxMjY2MTk1ODY5Ng.GB52Aa.KOdmIt8F2Ig7fTziWHb98MDUpFvM08cSyEqxRs';
-const CHALLONGE_API_KEY = '7043adaa156fd70080d970fdc8a9e49bef0a06dfdefe1d6b';
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const CHALLONGE_API_KEY = process.env.CHALLONGE_API_KEY;
 
 const client = new Client({ 
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] 
