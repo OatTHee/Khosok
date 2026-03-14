@@ -1,9 +1,7 @@
-
-
 const express = require('express');
 const app = express();
 app.get('/', (req, res) => res.send('Khosok is Online! 🟢'));
-app.listen(process.env.PORT || 3000,, '0.0.0.0', () => {
+app.listen(process.env.PORT || 3000, '0.0.0.0', () => {
     console.log('เซิร์ฟเวอร์จำลองเริ่มทำงานแล้ว พร้อมรับการปลุก!');
 });
 
@@ -12,7 +10,7 @@ const axios = require('axios');
 const tournamentTimers = new Map(); // หน่วยความจำสำหรับเก็บเวลาหมดรอบ
 const activePolls = new Map();
 
-// กำหนดค่าต่างๆ ของคุณที่นี่
+// กำหนดค่าต่างๆ ของคุณที่นี่ (ดึงจาก Environment Variables ปลอดภัย 100%)
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHALLONGE_API_KEY = process.env.CHALLONGE_API_KEY;
 
@@ -284,6 +282,7 @@ client.on('messageCreate', async message => {
     }
 
     if (command === '!setup') {
+        const tournamentId = message.content.split(' ')[1];
         if (!tournamentId) return message.reply('กรุณาระบุ ID ทัวร์นาเมนต์ด้วยครับ เช่น !setup m1neoxux');
 
         try {
