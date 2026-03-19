@@ -775,22 +775,182 @@ client.on('interactionCreate', async interaction => {
         if (action === 'register') {
             const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzIkudMeK7Nx-5xGXdj3TznDPE43-rHru_1yKcp-A7s502EPJyYEG7vIJ3bMgj1euklig/exec';
 
-            const gasRes = await axios.post(GAS_WEB_APP_URL, {
-                action: 'get_profile',
-                discordId: interaction.user.id
-            }, { timeout: 5000 });
+            try {
+                const gasRes = await axios.post(GAS_WEB_APP_URL, {
+                    action: 'get_profile',
+                    discordId: interaction.user.id
+                }, { timeout: 5000 });
 
-            const userProfile = gasRes.data;
+                const userProfile = gasRes.data;
 
-            if (!userProfile.found) {
-                return await interaction.editReply('❌ ยังไม่ได้ลงทะเบียน');
+                if (!userProfile.found) {
+                    return await interaction.editReply('❌ ยังไม่ได้ลงทะเบียน');
+                }
+
+                // เพิ่มผู้เข้าแข่ง
+                const registerRes = await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/participants.json`, {
+                    participant: {
+                        name: userProfile.realName || interaction.user.username
+                    }
+                }, {
+                    params: { api_key: CHALLONGE_API_KEY },
+                    timeout: 5000
+                });
+
+                return await interaction.editReply('✅ สมัครแข่งสำเร็จ!');
+            } catch (error) {
+                if (error.response?.status === 422) {
+                    return await interaction.editReply('⚠️ คุณได้สมัครไปแล้ว หรือ ID ไม่ถูก');
+                }
+                throw error;
             }
-
-            return await interaction.editReply('✅ ผ่านการตรวจสอบ');
         }
 
-        // 👉 TODO: ส่วนอื่นใช้ pattern เดิม
-        // (คุณ copy logic เดิมมาใส่ต่อได้เลย แต่ต้องอยู่หลัง deferReply)
+        // =========================
+        // 🟡 LEAVE
+        // =========================
+        if (action === 'leave') {
+            try {
+                const getRes = await axios.get(apiUrl, {
+                    params: { api_key: CHALLONGE_API_KEY }
+                });
+
+                const participants = getRes.data.map(p => p.participant);
+                const userParticipant = participants.find(p => p.name === nickname);
+
+                if (!userParticipant) {
+                    return await interaction.editReply('❌ ไม่พบการสมัครของคุณ');
+                }
+
+                await axios.delete(`https://api.challonge.com/v1/tournaments/${tournamentId}/participants/${userParticipant.id}.json`, {
+                    params: { api_key: CHALLONGE_API_KEY }
+                });
+
+                return await interaction.editReply('✅ ยกเลิกการสมัครแล้ว');
+            } catch (error) {
+                throw error;
+            }
+        }
+
+        // =========================
+        // 🟢 START
+        // =========================
+        if (action === 'start') {
+            if (!interaction.member.permissions.has('ManageMessages')) {
+                return await interaction.editReply('⛔ เฉพาะแอดมิน');
+            }
+
+            try {
+                await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/start.json`, {}, {
+                    params: { api_key: CHALLONGE_API_KEY }
+                });
+
+                return await interaction.editReply('✅ เริ่มแข่งขันแล้ว!');
+            } catch (error) {
+                if (error.response?.data?.errors?.includes('Tournament has already been started')) {
+                    return await interaction.editReply('⚠️ ทัวร์นาเมนต์นี้เริ่มแล้ว');
+                }
+                throw error;
+            }
+        }
+
+        // =========================
+        // ⏱️ TIMER
+        // =========================
+        if (action === 'timer') {
+            if (!interaction.member.permissions.has('ManageMessages')) {
+                return await interaction.editReply('⛔ เฉพาะแอดมิน');
+            }
+
+            const durationMs = 40 * 60 * 1000; // 40 นาที
+            const endTime = Date.now() + durationMs;
+
+            tournamentTimers.set(tournamentId, endTime);
+
+            const updatedEmbed = await getCurrentEmbed(tournamentId, endTime);
+            await interaction.message.edit({ embeds: [updatedEmbed] });
+
+            return await interaction.editReply('✅ เริ่มจับเวลา 40 นาทีแล้ว!');
+        }
+
+        // =========================
+        // 💸 REWARD
+        // =========================
+        if (action === 'reward') {
+            if (!interaction.member.permissions.has('ManageMessages')) {
+                return await interaction.editReply('⛔ เฉพาะแอดมิน');
+            }
+
+            const rewardCount = parseInt(parts[2]) || 3;
+            const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzIkudMeK7Nx-5xGXdj3TznDPE43-rHru_1yKcp-A7s502EPJyYEG7vIJ3bMgj1euklig/exec';
+
+            try {
+                const res = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}.json`, {
+                    params: { api_key: CHALLONGE_API_KEY, include_participants: 1 }
+                });
+
+                const players = res.data.tournament.participants.map(p => p.participant);
+                players.sort((a, b) => (a.final_rank || 999) - (b.final_rank || 999));
+
+                let rewardedCount = 0;
+                for (let i = 0; i < rewardCount && i < players.length; i++) {
+                    const player = players[i];
+                    
+                    // ดึง discordId จาก Discord mention ใน name
+                    const match = player.name.match(/<@(\d+)>/);
+                    if (match) {
+                        const discordId = match[1];
+
+                        await axios.post(GAS_WEB_APP_URL, {
+                            action: 'add_reward',
+                            discordId: discordId,
+                            points: 5
+                        });
+
+                        rewardedCount++;
+                    }
+                }
+
+                return await interaction.editReply(`✅ แจก 5 แต้มให้ Top ${rewardedCount} แล้ว!`);
+            } catch (error) {
+                throw error;
+            }
+        }
+
+        // =========================
+        // 🏁 FINISH
+        // =========================
+        if (action === 'finish') {
+            if (!interaction.member.permissions.has('ManageMessages')) {
+                return await interaction.editReply('⛔ เฉพาะแอดมิน');
+            }
+
+            try {
+                await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/finalize.json`, {}, {
+                    params: { api_key: CHALLONGE_API_KEY }
+                });
+
+                return await interaction.editReply('✅ ปิดจ็อบและบันทึกประวัติแล้ว!');
+            } catch (error) {
+                if (error.response?.data?.errors?.includes('Tournament cannot be finalized in its current state')) {
+                    return await interaction.editReply('⚠️ ไม่สามารถปิดจ็อบได้ ยังมีแมตช์รอดำเนินการ');
+                }
+                throw error;
+            }
+        }
+
+        // =========================
+        // 🔄 REFRESH LEADERBOARD
+        // =========================
+        if (action === 'refresh' && parts[1] === 'leaderboard') {
+            const newEmbed = await getLeaderboardEmbed();
+            if (!newEmbed) {
+                return await interaction.editReply('❌ ไม่สามารถโหลดข้อมูล');
+            }
+
+            await interaction.message.edit({ embeds: [newEmbed] });
+            return await interaction.editReply('✅ รีเฟรชแล้ว');
+        }
 
     } catch (error) {
         console.error('Interaction Error:', error);
