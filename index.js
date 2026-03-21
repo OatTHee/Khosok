@@ -1,3 +1,5 @@
+require('dotenv').config(); // [เพิ่มบรรทัดนี้] เพื่อให้บอทอ่านค่าจากไฟล์ .env ได้
+
 const express = require('express');
 const app = express();
 app.get('/', (req, res) => res.send('Khosok is Online! 🟢'));
@@ -768,69 +770,92 @@ client.on('interactionCreate', async interaction => {
             return await interaction.editReply('✅ อัปเดตแล้ว');
         }
 
+// =========================
+        // 🟢 REGISTER (สมัครแข่ง)
         // =========================
-        // 👇 ตัวอื่นๆ (สำคัญ: ใส่ timeout)
-        // =========================
-
         if (action === 'register') {
             const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzIkudMeK7Nx-5xGXdj3TznDPE43-rHru_1yKcp-A7s502EPJyYEG7vIJ3bMgj1euklig/exec';
 
             try {
+                // 1. ดึงข้อมูลจากฐานข้อมูล
                 const gasRes = await axios.post(GAS_WEB_APP_URL, {
                     action: 'get_profile',
                     discordId: interaction.user.id
-                }, { timeout: 5000 });
+                }, { timeout: 8000 });
 
                 const userProfile = gasRes.data;
 
                 if (!userProfile.found) {
-                    return await interaction.editReply('❌ ยังไม่ได้ลงทะเบียน');
+                    return await interaction.editReply('❌ คุณยังไม่ได้ลงทะเบียนในระบบฐานข้อมูลครับ');
                 }
 
-                // เพิ่มผู้เข้าแข่ง
-                const registerRes = await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/participants.json`, {
-                    participant: {
-                        name: userProfile.realName || interaction.user.username
-                    }
+                // 2. 🎯 คำนวณฉายา (ยศ) จาก EXP ปัจจุบัน
+                const title = getTitleByExp(userProfile.exp || 0);
+                
+                // 3. 🎯 ประกอบชื่อส่งให้ Challonge: [ฉายา] ชื่อ <@ID>
+                // (ต้องมี <@ID> ห้อยท้าย เพื่อให้ระบบกดแจกแต้มทำงานได้)
+                const challongeName = `[${title}] ${userProfile.realName || interaction.user.username} <@${interaction.user.id}>`;
+
+                // 4. ส่งชื่อเข้าทัวร์นาเมนต์
+                await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/participants.json`, {
+                    participant: { name: challongeName }
                 }, {
                     params: { api_key: CHALLONGE_API_KEY },
-                    timeout: 5000
+                    timeout: 8000
                 });
 
-                return await interaction.editReply('✅ สมัครแข่งสำเร็จ!');
+                // 5. 🎯 อัปเดต Banner ให้รายชื่อและยศโผล่ขึ้นมาทันที!
+                const updatedEmbed = await getSetupEmbed(tournamentId);
+                if (updatedEmbed) {
+                    await interaction.message.edit({ embeds: [updatedEmbed] });
+                }
+
+                return await interaction.editReply('✅ สมัครแข่งสำเร็จ พร้อมลุย!');
             } catch (error) {
                 if (error.response?.status === 422) {
-                    return await interaction.editReply('⚠️ คุณได้สมัครไปแล้ว หรือ ID ไม่ถูก');
+                    return await interaction.editReply('⚠️ คุณได้สมัครไปแล้ว หรือ ID ทัวร์นาเมนต์ไม่ถูกต้อง');
                 }
                 throw error;
             }
         }
 
         // =========================
-        // 🟡 LEAVE
+        // 🟡 LEAVE (สละสิทธิ์)
         // =========================
         if (action === 'leave') {
             try {
                 const getRes = await axios.get(apiUrl, {
-                    params: { api_key: CHALLONGE_API_KEY }
+                    params: { api_key: CHALLONGE_API_KEY },
+                    timeout: 8000
                 });
 
                 const participants = getRes.data.map(p => p.participant);
-                const userParticipant = participants.find(p => p.name === nickname);
+                
+                // 🎯 เปลี่ยนวิธีค้นหา: หาจาก Discord ID ที่แฝงอยู่ในชื่อแทนการใช้ Nickname
+                const userParticipant = participants.find(p => p.name.includes(`<@${interaction.user.id}>`));
 
                 if (!userParticipant) {
-                    return await interaction.editReply('❌ ไม่พบการสมัครของคุณ');
+                    return await interaction.editReply('❌ ไม่พบรายชื่อของคุณในการแข่งขันนี้ครับ');
                 }
 
+                // สั่งลบชื่อจาก Challonge
                 await axios.delete(`https://api.challonge.com/v1/tournaments/${tournamentId}/participants/${userParticipant.id}.json`, {
-                    params: { api_key: CHALLONGE_API_KEY }
+                    params: { api_key: CHALLONGE_API_KEY },
+                    timeout: 8000
                 });
 
-                return await interaction.editReply('✅ ยกเลิกการสมัครแล้ว');
+                // 🎯 อัปเดต Banner เพื่อให้ชื่อหายไปทันที!
+                const updatedEmbed = await getSetupEmbed(tournamentId);
+                if (updatedEmbed) {
+                    await interaction.message.edit({ embeds: [updatedEmbed] });
+                }
+
+                return await interaction.editReply('✅ สละสิทธิ์เรียบร้อยแล้ว');
             } catch (error) {
                 throw error;
             }
         }
+
 
         // =========================
         // 🟢 START
