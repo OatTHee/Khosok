@@ -775,6 +775,7 @@ client.on('interactionCreate', async interaction => {
         // =========================
         if (action === 'register') {
             const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzIkudMeK7Nx-5xGXdj3TznDPE43-rHru_1yKcp-A7s502EPJyYEG7vIJ3bMgj1euklig/exec';
+            const COMPETITOR_ROLE_ID = '1476156740738486457'; // ยศนักแข่ง
 
             try {
                 // 1. ดึงข้อมูลจากฐานข้อมูล
@@ -789,14 +790,11 @@ client.on('interactionCreate', async interaction => {
                     return await interaction.editReply('❌ คุณยังไม่ได้ลงทะเบียนในระบบฐานข้อมูลครับ');
                 }
 
-                // 2. 🎯 คำนวณฉายา (ยศ) จาก EXP ปัจจุบัน
+                // 2. คำนวณฉายา และเตรียมชื่อส่งให้ Challonge
                 const title = getTitleByExp(userProfile.exp || 0);
-                
-                // 3. 🎯 ประกอบชื่อส่งให้ Challonge: [ฉายา] ชื่อ <@ID>
-                // (ต้องมี <@ID> ห้อยท้าย เพื่อให้ระบบกดแจกแต้มทำงานได้)
                 const challongeName = `[${title}] ${userProfile.realName || interaction.user.username} <@${interaction.user.id}>`;
 
-                // 4. ส่งชื่อเข้าทัวร์นาเมนต์
+                // 3. ส่งชื่อเข้าทัวร์นาเมนต์
                 await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/participants.json`, {
                     participant: { name: challongeName }
                 }, {
@@ -804,13 +802,19 @@ client.on('interactionCreate', async interaction => {
                     timeout: 8000
                 });
 
-                // 5. 🎯 อัปเดต Banner ให้รายชื่อและยศโผล่ขึ้นมาทันที!
+                // 4. 🎯 มอบยศ "นักแข่ง" ให้ผู้สมัคร
+                const member = interaction.member;
+                if (member && !member.roles.cache.has(COMPETITOR_ROLE_ID)) {
+                    await member.roles.add(COMPETITOR_ROLE_ID).catch(console.error);
+                }
+
+                // 5. อัปเดต Banner ทันที
                 const updatedEmbed = await getSetupEmbed(tournamentId);
                 if (updatedEmbed) {
                     await interaction.message.edit({ embeds: [updatedEmbed] });
                 }
 
-                return await interaction.editReply('✅ สมัครแข่งสำเร็จ พร้อมลุย!');
+                return await interaction.editReply('✅ สมัครแข่งสำเร็จ และได้รับยศนักแข่งแล้ว!');
             } catch (error) {
                 if (error.response?.status === 422) {
                     return await interaction.editReply('⚠️ คุณได้สมัครไปแล้ว หรือ ID ทัวร์นาเมนต์ไม่ถูกต้อง');
@@ -823,6 +827,7 @@ client.on('interactionCreate', async interaction => {
         // 🟡 LEAVE (สละสิทธิ์)
         // =========================
         if (action === 'leave') {
+            const COMPETITOR_ROLE_ID = '1476156740738486457'; // ยศนักแข่ง
             try {
                 const getRes = await axios.get(apiUrl, {
                     params: { api_key: CHALLONGE_API_KEY },
@@ -831,7 +836,7 @@ client.on('interactionCreate', async interaction => {
 
                 const participants = getRes.data.map(p => p.participant);
                 
-                // 🎯 เปลี่ยนวิธีค้นหา: หาจาก Discord ID ที่แฝงอยู่ในชื่อแทนการใช้ Nickname
+                // ค้นหาจาก <@ID> เพื่อความแม่นยำ 100%
                 const userParticipant = participants.find(p => p.name.includes(`<@${interaction.user.id}>`));
 
                 if (!userParticipant) {
@@ -844,13 +849,19 @@ client.on('interactionCreate', async interaction => {
                     timeout: 8000
                 });
 
-                // 🎯 อัปเดต Banner เพื่อให้ชื่อหายไปทันที!
+                // 🎯 ถอดยศ "นักแข่ง" ออก
+                const member = interaction.member;
+                if (member && member.roles.cache.has(COMPETITOR_ROLE_ID)) {
+                    await member.roles.remove(COMPETITOR_ROLE_ID).catch(console.error);
+                }
+
+                // อัปเดต Banner ทันที
                 const updatedEmbed = await getSetupEmbed(tournamentId);
                 if (updatedEmbed) {
                     await interaction.message.edit({ embeds: [updatedEmbed] });
                 }
 
-                return await interaction.editReply('✅ สละสิทธิ์เรียบร้อยแล้ว');
+                return await interaction.editReply('✅ สละสิทธิ์ และถอดยศนักแข่งเรียบร้อยแล้ว');
             } catch (error) {
                 throw error;
             }
@@ -942,25 +953,98 @@ client.on('interactionCreate', async interaction => {
             }
         }
 
-        // =========================
-        // 🏁 FINISH
-        // =========================
+       // ==========================================
+        // 🏁 ฟังก์ชันปุ่ม FINISH (เชื่อมต่อกับ GAS: finish_tournament)
+        // ==========================================
         if (action === 'finish') {
+            const COMPETITOR_ROLE_ID = '1476156740738486457'; // ID ยศนักแข่ง
+            const GAS_WEB_APP_URL = process.env.GAS_WEB_APP_URL; 
+
             if (!interaction.member.permissions.has('ManageMessages')) {
-                return await interaction.editReply('⛔ เฉพาะแอดมิน');
+                return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
             }
 
             try {
+                // 1. ดึงข้อมูลตัวทัวร์นาเมนต์ (เพื่อเอาชื่อรายการ)
+                const tourneyRes = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}.json`, {
+                    params: { api_key: CHALLONGE_API_KEY }
+                });
+                const tournamentName = tourneyRes.data.tournament.name;
+
+                // 2. ดึงรายชื่อผู้แข่งและอันดับ (สำหรับ participantsList และ playerStats)
+                const partRes = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}/participants.json`, {
+                    params: { api_key: CHALLONGE_API_KEY }
+                });
+
+                let participantsList = "";
+                let playerStats = [];
+                const participantMap = {}; // เก็บไว้ใช้คู่กับประวัติการแข่ง
+
+                partRes.data.forEach((p, index) => {
+                    const participant = p.participant;
+                    const name = participant.name;
+                    const rank = participant.final_rank || (index + 1);
+                    const discordIdMatch = name.match(/<@(\d+)>/);
+                    const discordId = discordIdMatch ? discordIdMatch[1] : null;
+
+                    participantMap[participant.id] = name; // Map ID กับชื่อไว้ทำ matchHistory
+                    
+                    // สร้างข้อความรายชื่อผู้เข้าร่วม (พร้อมอันดับ)
+                    participantsList += `${rank}. ${name}\n`;
+
+                    // เตรียมข้อมูลสถิติสำหรับอัปเดต Exp/Top (เฉพาะคนที่มี Discord ID)
+                    if (discordId) {
+                        playerStats.push({
+                            discordId: discordId,
+                            rank: rank
+                        });
+                    }
+                });
+
+                // 3. ดึงประวัติการแข่งขัน (สำหรับ matchHistory)
+                const matchRes = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}/matches.json`, {
+                    params: { api_key: CHALLONGE_API_KEY }
+                });
+
+                let matchHistory = "";
+                matchRes.data.forEach(m => {
+                    const match = m.match;
+                    const p1 = participantMap[match.player1_id] || "Unknown";
+                    const p2 = participantMap[match.player2_id] || "Unknown";
+                    const winner = participantMap[match.winner_id] || "เสมอ/ไม่มีผู้ชนะ";
+                    const score = match.scores_csv || "0-0";
+                    
+                    matchHistory += `รอบ ${match.round}: ${p1} vs ${p2} | ชนะ: ${winner} (${score})\n`;
+                });
+
+                // 4. ส่งข้อมูลทั้งหมดไปยัง GAS (ตามโครงสร้าง payload ของคุณ)
+                await axios.post(GAS_WEB_APP_URL, {
+                    action: "finish_tournament",
+                    tournamentName: tournamentName,
+                    participantsList: participantsList.trim(),
+                    matchHistory: matchHistory.trim(),
+                    playerStats: playerStats
+                });
+
+                // 5. สั่ง Finalize ใน Challonge
                 await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/finalize.json`, {}, {
                     params: { api_key: CHALLONGE_API_KEY }
                 });
 
-                return await interaction.editReply('✅ ปิดจ็อบและบันทึกประวัติแล้ว!');
-            } catch (error) {
-                if (error.response?.data?.errors?.includes('Tournament cannot be finalized in its current state')) {
-                    return await interaction.editReply('⚠️ ไม่สามารถปิดจ็อบได้ ยังมีแมตช์รอดำเนินการ');
+                // 6. 🎯 ถอดยศนักแข่งออกจากสมาชิกทุกคน
+                const role = interaction.guild.roles.cache.get(COMPETITOR_ROLE_ID);
+                if (role) {
+                    await interaction.guild.members.fetch();
+                    for (const [id, member] of role.members) {
+                        await member.roles.remove(COMPETITOR_ROLE_ID).catch(() => {});
+                    }
                 }
-                throw error;
+
+                return await interaction.editReply(`✅ ปิดงานแข่ง **"${tournamentName}"** เรียบร้อย!\n📊 ระบบได้ทำการคำนวณสถิติและแจก Exp ให้ผู้เล่น ${playerStats.length} รายเรียบร้อยแล้วครับ`);
+
+            } catch (error) {
+                console.error(error);
+                return await interaction.editReply('❌ เกิดข้อผิดพลาดในการบันทึกข้อมูล กรุณาตรวจสอบว่ากรอกผลใน Challonge ครบทุกคู่หรือยัง');
             }
         }
 
