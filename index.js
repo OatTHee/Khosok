@@ -891,86 +891,131 @@ client.on('interactionCreate', async interaction => {
         // 💸 REWARD (ปุ่มแจกแต้ม)
         // =========================
         if (action === 'reward') {
-            if (!interaction.member.permissions.has('ManageMessages')) {
-                return await interaction.editReply('⛔ เฉพาะแอดมิน');
-            }
+            if (!interaction.member.permissions.has('ManageMessages')) return await interaction.editReply('⛔ เฉพาะแอดมิน');
 
             const rewardCount = parseInt(parts[2]) || 3;
-            // 🎯 แก้ไขลิงก์ให้เป็น String ตรงๆ เพื่อป้องกัน undefined
             const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzIkudMeK7Nx-5xGXdj3TznDPE43-rHru_1yKcp-A7s502EPJyYEG7vIJ3bMgj1euklig/exec';
 
             try {
+                // 1. ดึงข้อมูลผู้เข้าแข่งและแมตช์ทั้งหมดมาคำนวณเอง
                 const res = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}.json`, {
-                    params: { api_key: CHALLONGE_API_KEY, include_participants: 1 }
+                    params: { api_key: CHALLONGE_API_KEY, include_participants: 1, include_matches: 1 }
                 });
 
-                const tournamentName = res.data.tournament.name; // ดึงชื่อรายการมาด้วยเพื่อให้ GAS บันทึกได้
-                const players = res.data.tournament.participants.map(p => p.participant);
-                players.sort((a, b) => (a.final_rank || 999) - (b.final_rank || 999));
+                const tournamentName = res.data.tournament.name;
+                let players = res.data.tournament.participants.map(p => p.participant);
+                let matches = res.data.tournament.matches ? res.data.tournament.matches.map(m => m.match) : [];
 
+                // 2. คำนวณ ชนะ/แพ้ แบบเจาะลึก
+                players.forEach(p => { p.calc_wins = 0; p.calc_losses = 0; p.is_forfeit = false; });
+                matches.forEach(m => {
+                    if (m.state === 'complete') {
+                        if (m.winner_id) {
+                            let winner = players.find(p => p.id === m.winner_id);
+                            let loser_id = (m.player1_id === m.winner_id) ? m.player2_id : m.player1_id;
+                            let loser = players.find(p => p.id === loser_id);
+                            if (winner) winner.calc_wins += 1;
+                            if (loser) loser.calc_losses += 1;
+                        }
+                        // เช็คสละสิทธิ์หรือโดนปรับฟาวล์จากสกอร์ติดลบ
+                        if (m.scores_csv) {
+                            let setScores = m.scores_csv.split(',');
+                            setScores.forEach(scoreStr => {
+                                let pts = scoreStr.match(/(-?\d+)-(-?\d+)/);
+                                if (pts) {
+                                    if (parseInt(pts[1]) < 0) { let p1 = players.find(p => p.id === m.player1_id); if (p1) p1.is_forfeit = true; }
+                                    if (parseInt(pts[2]) < 0) { let p2 = players.find(p => p.id === m.player2_id); if (p2) p2.is_forfeit = true; }
+                                }
+                            });
+                        }
+                    }
+                });
+
+                // 3. จัดเรียงอันดับตามความเก่งเป๊ะๆ
+                players.sort((a, b) => {
+                    const rankA = a.final_rank; const rankB = b.final_rank;
+                    if (rankA && rankB) {
+                        if (rankA !== rankB) return rankA - rankB;
+                        if (a.is_forfeit !== b.is_forfeit) return a.is_forfeit ? 1 : -1;
+                        if (a.calc_wins !== b.calc_wins) return b.calc_wins - a.calc_wins;
+                        return a.calc_losses - b.calc_losses;
+                    }
+                    if (!rankA && rankB) return -1;
+                    if (rankA && !rankB) return 1;
+                    if (b.calc_wins !== a.calc_wins) return b.calc_wins - a.calc_wins;
+                    return a.calc_losses - b.calc_losses;
+                });
+
+                // 4. เลือกผู้ชนะเพื่อส่งไปแจกแต้ม
                 let winners = [];
-                for (let i = 0; i < rewardCount && i < players.length; i++) {
+                let currentDisplayRank = 1;
+
+                for (let i = 0; i < players.length; i++) {
+                    let listIndex = i + 1;
+                    // จัดกลุ่มอันดับ 3 ร่วม (อันดับ 3 และ 4 ในแถว ให้ถือเป็นอันดับ 3)
+                    if (listIndex === 1) currentDisplayRank = 1;
+                    else if (listIndex === 2) currentDisplayRank = 2;
+                    else if (listIndex === 3 || listIndex === 4) currentDisplayRank = 3;
+                    else currentDisplayRank = listIndex - 1; 
+
+                    // ถ้าอันดับเกินโควต้าที่ตั้งไว้ ให้หยุดทำงานทันที (แจกแค่ 3 หรือ 5 คน)
+                    if (currentDisplayRank > rewardCount) break;
+
                     const player = players[i];
-                    
-                    // ดึง discordId จาก Discord mention ใน name
                     const match = player.name.match(/<@(\d+)>/);
                     if (match) {
-                        // 🎯 จัด Format เป็น Array ให้ตรงกับที่ GAS ต้องการ (payload.winners)
-                        winners.push({
-                            discordId: match[1],
-                            points: 5,
-                            name: tournamentName 
-                        });
+                        winners.push({ discordId: match[1], points: 5, name: tournamentName });
                     }
                 }
 
                 if (winners.length > 0) {
-                    // 🎯 เปลี่ยน action เป็น 'award_points' และส่งแบบก้อนเดียว
-                    await axios.post(GAS_WEB_APP_URL, {
-                        action: 'award_points',
-                        winners: winners
-                    });
+                    await axios.post(GAS_WEB_APP_URL, { action: 'award_points', winners: winners });
                 }
 
-                return await interaction.editReply(`✅ แจก 5 แต้มให้ Top ${winners.length} คน จากรายการ ${tournamentName} เรียบร้อย!`);
+                return await interaction.editReply(`✅ แจก 5 แต้มให้ Top ${rewardCount} เรียบร้อย! (จำนวนผู้ได้รับแจกทั้งหมด: ${winners.length} คน)`);
             } catch (error) {
                 console.error("Reward Error:", error);
                 return await interaction.editReply('❌ เกิดข้อผิดพลาดในการแจกแต้ม');
             }
         }
 
-       // ==========================================
-        // 🏁 ฟังก์ชันปุ่ม FINISH (เชื่อมต่อกับ GAS: finish_tournament)
+      // ==========================================
+        // 🏁 FINISH (ปุ่มปิดจ็อบ & บันทึกสถิติ)
         // ==========================================
         if (action === 'finish') {
-            const COMPETITOR_ROLE_ID = '1476156740738486457'; // ID ยศนักแข่ง
-            // 🎯 แก้ไขลิงก์ให้เป็น String ตรงๆ ป้องกัน Error undefined
+            const COMPETITOR_ROLE_ID = '1476156740738486457'; 
             const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzIkudMeK7Nx-5xGXdj3TznDPE43-rHru_1yKcp-A7s502EPJyYEG7vIJ3bMgj1euklig/exec'; 
 
-            if (!interaction.member.permissions.has('ManageMessages')) {
-                return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
-            }
+            if (!interaction.member.permissions.has('ManageMessages')) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
 
             try {
-                // 1. ดึงข้อมูลตัวทัวร์นาเมนต์ (เพื่อเอาชื่อรายการ)
-                const tourneyRes = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}.json`, {
+                // 🎯 1. สั่ง Finalize ใน Challonge เป็นอย่างแรก! 
+                // เพื่อให้ระบบคำนวณ final_rank ให้ครบทุกคนก่อนจะดึงข้อมูลไปแจก EXP
+                await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/finalize.json`, {}, {
                     params: { api_key: CHALLONGE_API_KEY }
                 });
-                const tournamentName = tourneyRes.data.tournament.name;
 
-                // 2. ดึงรายชื่อผู้แข่งและอันดับ (สำหรับ participantsList และ playerStats)
-                const partRes = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}/participants.json`, {
-                    params: { api_key: CHALLONGE_API_KEY }
+                // 2. ดึงข้อมูลที่อัปเดต final_rank เสร็จสมบูรณ์แล้ว
+                const tourneyRes = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}.json`, {
+                    params: { api_key: CHALLONGE_API_KEY, include_participants: 1, include_matches: 1 }
                 });
+
+                const tournamentName = tourneyRes.data.tournament.name;
+                const matches = tourneyRes.data.tournament.matches.map(m => m.match);
+                let players = tourneyRes.data.tournament.participants.map(p => p.participant);
+
+                // 3. นำรายชื่อมาจัดเรียงตาม final_rank ที่ Challonge สรุปให้
+                players.sort((a, b) => (a.final_rank || 999) - (b.final_rank || 999));
 
                 let participantsList = "";
                 let playerStats = [];
                 const participantMap = {};
 
-                partRes.data.forEach((p, index) => {
-                    const participant = p.participant;
+                // 4. วนลูปจับคู่เพื่อส่งให้ GAS
+                players.forEach((participant, index) => {
                     const name = participant.name;
-                    const rank = participant.final_rank || (index + 1);
+                    // ถึงตรงนี้รับรองว่ามี final_rank แน่นอน 100%
+                    const rank = participant.final_rank || (index + 1); 
                     const discordIdMatch = name.match(/<@(\d+)>/);
                     const discordId = discordIdMatch ? discordIdMatch[1] : null;
 
@@ -978,30 +1023,21 @@ client.on('interactionCreate', async interaction => {
                     participantsList += `${rank}. ${name}\n`;
 
                     if (discordId) {
-                        playerStats.push({
-                            discordId: discordId,
-                            rank: rank
-                        });
+                        playerStats.push({ discordId: discordId, rank: rank });
                     }
                 });
 
-                // 3. ดึงประวัติการแข่งขัน (สำหรับ matchHistory)
-                const matchRes = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}/matches.json`, {
-                    params: { api_key: CHALLONGE_API_KEY }
-                });
-
+                // 5. สรุปแมตช์ที่แข่งมาทั้งหมด
                 let matchHistory = "";
-                matchRes.data.forEach(m => {
-                    const match = m.match;
+                matches.forEach(match => {
                     const p1 = participantMap[match.player1_id] || "Unknown";
                     const p2 = participantMap[match.player2_id] || "Unknown";
                     const winner = participantMap[match.winner_id] || "เสมอ/ไม่มีผู้ชนะ";
                     const score = match.scores_csv || "0-0";
-                    
                     matchHistory += `รอบ ${match.round}: ${p1} vs ${p2} | ชนะ: ${winner} (${score})\n`;
                 });
 
-                // 4. ส่งข้อมูลทั้งหมดไปยัง GAS
+                // 6. ส่งข้อมูลที่ถูกต้องทั้งหมดไปยัง GAS (เพื่อแจก EXP)
                 await axios.post(GAS_WEB_APP_URL, {
                     action: "finish_tournament",
                     tournamentName: tournamentName,
@@ -1010,12 +1046,7 @@ client.on('interactionCreate', async interaction => {
                     playerStats: playerStats
                 });
 
-                // 5. สั่ง Finalize ใน Challonge (จะทำได้ก็ต่อเมื่อในเว็บ Challonge ใส่ผลคะแนนครบทุกคู่แล้ว)
-                await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/finalize.json`, {}, {
-                    params: { api_key: CHALLONGE_API_KEY }
-                });
-
-                // 6. 🎯 ถอดยศนักแข่งออกจากสมาชิกทุกคน
+                // 7. เคลียร์ยศนักแข่ง
                 const role = interaction.guild.roles.cache.get(COMPETITOR_ROLE_ID);
                 if (role) {
                     await interaction.guild.members.fetch();
@@ -1024,20 +1055,20 @@ client.on('interactionCreate', async interaction => {
                     }
                 }
 
-                return await interaction.editReply(`✅ ปิดงานแข่ง **"${tournamentName}"** เรียบร้อย!\n📊 ระบบได้บันทึกสถิติ แจก Exp ให้ผู้เล่น และเคลียร์ยศนักแข่งเรียบร้อยแล้วครับ`);
+                return await interaction.editReply(`✅ ปิดงานแข่ง **"${tournamentName}"** เรียบร้อย!\n📊 ระบบแจก EXP ตามขั้นบันได (60/40/30/10) ให้ผู้เล่น ${playerStats.length} คน สำเร็จ!`);
 
             } catch (error) {
                 console.error("Finish Error:", error.response?.data || error.message);
                 
-                // ดักจับ Error กรณีใส่คะแนนการแข่งขันใน Challonge ไม่ครบ
+                // ถ้ายิง Finalize ไม่ผ่าน (เพราะแข่งยังไม่จบ หรือกรอกคะแนนไม่ครบ) จะเด้งมาตรงนี้ทันที บอทจะปลอดภัย
                 if (error.response?.status === 422) {
-                    return await interaction.editReply('⚠️ ไม่สามารถปิดจ็อบได้ กรุณาตรวจสอบในหน้าเว็บ Challonge ว่าใส่ผลคะแนนและกดจบแมตช์ครบทุกคู่หรือยังครับ');
+                    return await interaction.editReply('⚠️ ไม่สามารถปิดจ็อบได้ ตรวจสอบใน Challonge ว่ามีคู่ไหนยังไม่ได้กรอกผลการแข่งบ้างครับ');
                 }
                 
-                return await interaction.editReply('❌ เกิดข้อผิดพลาดในการบันทึกข้อมูล ดูรายละเอียดได้ใน Log ของบอทครับ');
+                return await interaction.editReply('❌ เกิดข้อผิดพลาด กรุณาตรวจสอบ Log');
             }
         }
-
+        
         // =========================
         // 🔄 REFRESH LEADERBOARD
         // =========================
