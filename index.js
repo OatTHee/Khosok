@@ -409,12 +409,7 @@ client.on('messageCreate', async message => {
 
             players.forEach((p, index) => {
                 const listIndex = index + 1; 
-                let displayRank; 
-
-                if (listIndex === 1) displayRank = 1;
-                else if (listIndex === 2) displayRank = 2;
-                else if (listIndex === 3 || listIndex === 4) displayRank = 3;
-                else displayRank = listIndex - 1; 
+                let displayRank = listIndex; // 🎯 รันตัวเลขตามอันดับจริง ไม่มีอันดับร่วมแล้ว
 
                 const wins = p.calc_wins !== undefined ? p.calc_wins : 0; 
                 const losses = p.calc_losses !== undefined ? p.calc_losses : 0; 
@@ -426,8 +421,8 @@ client.on('messageCreate', async message => {
                     standingText += `🥇 **อันดับ 1 : ${p.name}** (ชนะ ${wins} แพ้ ${losses}) ${isRewarded}\n`;
                 } else if (listIndex === 2) {
                     standingText += `🥈 **อันดับ 2 : ${p.name}** (ชนะ ${wins} แพ้ ${losses}) ${isRewarded}\n`;
-                } else if (listIndex === 3 || listIndex === 4) {
-                    standingText += `🥉 **อันดับ 3 : ${p.name} (ที่ 3 ร่วม)** (ชนะ ${wins} แพ้ ${losses}) ${isRewarded}\n`;
+                } else if (listIndex === 3) {
+                    standingText += `🥉 **อันดับ 3 : ${p.name}** (ชนะ ${wins} แพ้ ${losses}) ${isRewarded}\n`;
                 } else {
                     standingText += `🔹 อันดับ ${displayRank} : ${p.name}${forfeitTag} (ชนะ ${wins} แพ้ ${losses}) ${isRewarded}\n`;
                 }
@@ -952,11 +947,7 @@ client.on('interactionCreate', async interaction => {
 
                 for (let i = 0; i < players.length; i++) {
                     let listIndex = i + 1;
-                    // จัดกลุ่มอันดับ 3 ร่วม (อันดับ 3 และ 4 ในแถว ให้ถือเป็นอันดับ 3)
-                    if (listIndex === 1) currentDisplayRank = 1;
-                    else if (listIndex === 2) currentDisplayRank = 2;
-                    else if (listIndex === 3 || listIndex === 4) currentDisplayRank = 3;
-                    else currentDisplayRank = listIndex - 1; 
+                    currentDisplayRank = listIndex; // 🎯 รันตามอันดับจริง 1, 2, 3, 4... ให้ตรงกับป้ายประกาศผล
 
                     // ถ้าอันดับเกินโควต้าที่ตั้งไว้ ให้หยุดทำงานทันที (แจกแค่ 3 หรือ 5 คน)
                     if (currentDisplayRank > rewardCount) break;
