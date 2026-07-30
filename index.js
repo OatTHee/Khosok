@@ -198,9 +198,9 @@ let leaderboardInterval = null;
 // 3. ฟังก์ชันสร้างบอร์ดจัดอันดับ (Leaderboard)
 async function getLeaderboardEmbed() {
     // 📌 ลิงก์ Web App URL เดิมของคุณ
-    const GAS_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbzIkudMeK7Nx-5xGXdj3TznDPE43-rHru_1yKcp-A7s502EPJyYEG7vIJ3bMgj1euklig/exec"; 
+    const GAS_WEB_APP_URL = process.env.BOT_BRIDGE_URL; 
     try {
-        const res = await axios.post(GAS_WEB_APP_URL, { action: "get_leaderboard" });
+        const res = await axios.post(GAS_WEB_APP_URL, { action: "get_leaderboard" }, { headers: { 'x-bot-secret': process.env.BOT_BRIDGE_SECRET } });
         const players = res.data.data;
 
         if (!players || players.length === 0) {
@@ -473,7 +473,7 @@ client.on('messageCreate', async message => {
         // ถ้ามีการแท็กเพื่อน ให้ดูโปรไฟล์เพื่อน ถ้าไม่แท็ก ให้ดูของตัวเอง
         const targetUser = message.mentions.users.first() || message.author;
         // 📌 ใส่ลิงก์ Web App URL ของคุณที่นี่ (อันเดิมกับที่ใช้ในปุ่ม reward)
-        const GAS_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbzIkudMeK7Nx-5xGXdj3TznDPE43-rHru_1yKcp-A7s502EPJyYEG7vIJ3bMgj1euklig/exec"; 
+        const GAS_WEB_APP_URL = process.env.BOT_BRIDGE_URL; 
 
         const loadingMsg = await message.reply('🔄 กำลังเชื่อมต่อฐานข้อมูลไดโนมาสเตอร์... กรุณารอสักครู่');
 
@@ -482,7 +482,7 @@ client.on('messageCreate', async message => {
             const res = await axios.post(GAS_WEB_APP_URL, {
                 action: "get_profile",
                 discordId: targetUser.id
-            });
+            }, { headers: { 'x-bot-secret': process.env.BOT_BRIDGE_SECRET } });
             const data = res.data;
 
             loadingMsg.delete().catch(() => {});
@@ -761,14 +761,14 @@ client.on('interactionCreate', async interaction => {
         // 🟢 REGISTER (สมัครแข่ง)
         // =========================
         if (action === 'register') {
-            const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzIkudMeK7Nx-5xGXdj3TznDPE43-rHru_1yKcp-A7s502EPJyYEG7vIJ3bMgj1euklig/exec';
+            const GAS_WEB_APP_URL = process.env.BOT_BRIDGE_URL;
 
             try {
                 // เช็คก่อนว่าลงทะเบียนในระบบเว็บแอปหรือยัง
                 const gasRes = await axios.post(GAS_WEB_APP_URL, {
                     action: 'get_profile',
                     discordId: interaction.user.id
-                }, { timeout: 8000 });
+                }, { timeout: 8000, headers: { 'x-bot-secret': process.env.BOT_BRIDGE_SECRET } });
 
                 const userProfile = gasRes.data;
 
@@ -889,7 +889,7 @@ client.on('interactionCreate', async interaction => {
             if (!interaction.member.permissions.has('ManageMessages')) return await interaction.editReply('⛔ เฉพาะแอดมิน');
 
             const rewardCount = parseInt(parts[2]) || 3;
-            const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzIkudMeK7Nx-5xGXdj3TznDPE43-rHru_1yKcp-A7s502EPJyYEG7vIJ3bMgj1euklig/exec';
+            const GAS_WEB_APP_URL = process.env.BOT_BRIDGE_URL;
 
             try {
                 // 1. ดึงข้อมูลผู้เข้าแข่งและแมตช์ทั้งหมดมาคำนวณเอง
@@ -960,7 +960,7 @@ client.on('interactionCreate', async interaction => {
                 }
 
                 if (winners.length > 0) {
-                    await axios.post(GAS_WEB_APP_URL, { action: 'award_points', winners: winners });
+                    await axios.post(GAS_WEB_APP_URL, { action: 'award_points', winners: winners }, { headers: { 'x-bot-secret': process.env.BOT_BRIDGE_SECRET } });
                 }
 
                 return await interaction.editReply(`✅ แจก 5 แต้มให้ Top ${rewardCount} เรียบร้อย! (จำนวนผู้ได้รับแจกทั้งหมด: ${winners.length} คน)`);
@@ -975,7 +975,7 @@ client.on('interactionCreate', async interaction => {
         // ==========================================
         if (action === 'finish') {
             const COMPETITOR_ROLE_ID = '1476156740738486457'; 
-            const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzIkudMeK7Nx-5xGXdj3TznDPE43-rHru_1yKcp-A7s502EPJyYEG7vIJ3bMgj1euklig/exec'; 
+            const GAS_WEB_APP_URL = process.env.BOT_BRIDGE_URL; 
 
             if (!interaction.member.permissions.has('ManageMessages')) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
 
@@ -1035,7 +1035,7 @@ client.on('interactionCreate', async interaction => {
                     participantsList: participantsList.trim(),
                     matchHistory: matchHistory.trim(),
                     playerStats: playerStats
-                });
+                }, { headers: { 'x-bot-secret': process.env.BOT_BRIDGE_SECRET } });
 
                 // 7. เคลียร์ยศนักแข่ง
                 const role = interaction.guild.roles.cache.get(COMPETITOR_ROLE_ID);
