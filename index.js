@@ -955,7 +955,9 @@ client.on('interactionCreate', async interaction => {
                     const player = players[i];
                     const match = player.name.match(/<@(\d+)>/);
                     if (match) {
-                        winners.push({ discordId: match[1], points: 5, name: tournamentName });
+                        // แชมป์ (อันดับ 1) ได้ 10 แต้ม ที่เหลือได้ 5 แต้มเท่าเดิม
+                        const points = currentDisplayRank === 1 ? 10 : 5;
+                        winners.push({ discordId: match[1], points, name: tournamentName });
                     }
                 }
 
@@ -963,7 +965,7 @@ client.on('interactionCreate', async interaction => {
                     await axios.post(GAS_WEB_APP_URL, { action: 'award_points', winners: winners }, { headers: { 'x-bot-secret': process.env.BOT_BRIDGE_SECRET } });
                 }
 
-                return await interaction.editReply(`✅ แจก 5 แต้มให้ Top ${rewardCount} เรียบร้อย! (จำนวนผู้ได้รับแจกทั้งหมด: ${winners.length} คน)`);
+                return await interaction.editReply(`✅ แจกแต้มให้ Top ${rewardCount} เรียบร้อย! (แชมป์ 10 แต้ม, อันดับอื่น 5 แต้ม — รวมผู้ได้รับ ${winners.length} คน)`);
             } catch (error) {
                 console.error("Reward Error:", error);
                 return await interaction.editReply('❌ เกิดข้อผิดพลาดในการแจกแต้ม');
