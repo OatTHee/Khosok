@@ -12,10 +12,15 @@ const axios = require('axios');
 axios.defaults.timeout = 8000; // ตัดจบถ้านานเกิน 8 วินาที
 const tournamentTimers = new Map(); // หน่วยความจำสำหรับเก็บเวลาหมดรอบ
 const activePolls = new Map();
+const pendingFinish = new Map(); // เก็บสถานะ "ติ๊กคนเล่นครบทุกรอบ" ก่อนกดยืนยันปิดจ็อบ
 
 // กำหนดค่าต่างๆ ของคุณที่นี่ (ดึงจาก Environment Variables ปลอดภัย 100%)
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHALLONGE_API_KEY = process.env.CHALLONGE_API_KEY;
+
+// 🟢 Supabase (ฐานข้อมูลใหม่ แทน Google Sheet)
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
 const client = new Client({ 
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] 
@@ -25,10 +30,11 @@ const client = new Client({
 // 🏅 ฟังก์ชันแปลง EXP เป็นฉายา (แก้ที่นี่จุดเดียว เปลี่ยนทั้งระบบ)
 // =========================================================
 function getTitleByExp(exp) {
-    if (exp >= 260) return "🐦‍🔥 รีคอลปีศาจ";
-    if (exp >= 230) return "⚜️ รีคอลระดับเทพ";
-    if (exp >= 200) return "👑 รีคอลระดับราชา";
-    if (exp >= 180) return "🔱 รีคอลระดับตำนาน";
+    if (exp >= 400) return "🦖 เจ้าแห่งเมโซโซอิก";
+    if (exp >= 350) return "🐦‍🔥 รีคอลปีศาจ";
+    if (exp >= 300) return "⚜️ รีคอลระดับเทพ";
+    if (exp >= 260) return "👑 รีคอลระดับราชา";
+    if (exp >= 240) return "🔱 รีคอลระดับตำนาน";
     if (exp >= 165) return "⚔️ รีคอลยอดฝีมือ I";
     if (exp >= 150) return "⚔️ รีคอลยอดฝีมือ II";
     if (exp >= 130) return "🌿 รีคอลขั้นสูง I";
@@ -41,6 +47,101 @@ function getTitleByExp(exp) {
     if (exp >= 20) return "🐣 รีคอลฝึกหัด II";
     if (exp >= 10) return "🐣 รีคอลฝึกหัด III";
     return "🥚 รีคอลหน้าใหม่";
+}
+
+// =========================================================
+// ✨ สูตรคำนวณ EXP หลังจบงานแข่ง (แก้ที่นี่จุดเดียว)
+//    เข้าร่วม (ลงแข่งอย่างน้อย 1 ตา)      = +10
+//    เล่นครบทุกรอบ (แอดมินติ๊ก)           = +10
+//    อันดับ 1 (แชมป์)                     = +50  → ครบทุกรอบ = 70
+//    อันดับ 2-3 (Top 3)                   = +30  → ครบทุกรอบ = 50
+//    อันดับ 4-5 (Top 5)                   = +20  → ครบทุกรอบ = 40
+// =========================================================
+const EXP_JOIN = 10;
+const EXP_FULL_PLAY = 10;
+
+function getPlacementExp(rank) {
+    if (rank === 1) return 50;
+    if (rank <= 3) return 30;
+    if (rank <= 5) return 20;
+    return 0;
+}
+
+function calcTournamentExp(rank, playedAll) {
+    return getPlacementExp(rank) + EXP_JOIN + (playedAll ? EXP_FULL_PLAY : 0);
+}
+
+// นับจำนวนแมตช์ที่ "แข่งจบจริง" ของผู้เล่นแต่ละคน (ใช้คัดคนที่สมัครแต่ไม่ได้ลงเลยออก)
+function countMatchesPlayed(matches) {
+    const played = {};
+    matches.forEach(m => {
+        if (m.state !== 'complete') return;
+        if (m.player1_id) played[m.player1_id] = (played[m.player1_id] || 0) + 1;
+        if (m.player2_id) played[m.player2_id] = (played[m.player2_id] || 0) + 1;
+    });
+    return played;
+}
+
+// =========================================================
+// 🗳️ สร้างหน้าจอติ๊ก "ใครเล่นครบทุกรอบ" ก่อนแจก EXP
+// =========================================================
+function buildFullPlayComponents(tournamentId, state) {
+    const rows = [];
+
+    state.chunks.forEach((chunk, chunkIndex) => {
+        const menu = new StringSelectMenuBuilder()
+            .setCustomId(`fullplay_${tournamentId}_${chunkIndex}`)
+            .setPlaceholder(`✅ ติ๊กคนที่เล่นครบทุกรอบ (ชุดที่ ${chunkIndex + 1})`)
+            .setMinValues(0)
+            .setMaxValues(chunk.length)
+            .addOptions(
+                chunk.map(p =>
+                    new StringSelectMenuOptionBuilder()
+                        .setLabel(p.label.substring(0, 100))
+                        .setValue(p.discordId)
+                        .setDefault(state.full.has(p.discordId))
+                )
+            );
+        rows.push(new ActionRowBuilder().addComponents(menu));
+    });
+
+    rows.push(new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`fullall_${tournamentId}`)
+            .setLabel('ทุกคนเล่นครบ')
+            .setStyle(ButtonStyle.Success)
+            .setEmoji('✅'),
+        new ButtonBuilder()
+            .setCustomId(`fullconfirm_${tournamentId}`)
+            .setLabel('ยืนยัน & ปิดจ็อบ')
+            .setStyle(ButtonStyle.Danger)
+            .setEmoji('🏁'),
+        new ButtonBuilder()
+            .setCustomId(`fullcancel_${tournamentId}`)
+            .setLabel('ยกเลิก')
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji('✖️')
+    ));
+
+    return rows;
+}
+
+function buildFullPlayText(state) {
+    let text = `📝 **ให้คะแนนพฤติกรรมก่อนแจก EXP — ${state.tournamentName}**\n`;
+    text += `ติ๊กเฉพาะคนที่ **อยู่เล่นครบทุกรอบ** (ค่าเริ่มต้นติ๊กไว้ให้ทุกคนแล้ว ถ้าใครกลับก่อน/ไม่ครบ ให้เอาติ๊กออก)\n\n`;
+
+    state.players.forEach(p => {
+        const ticked = state.full.has(p.discordId) ? '☑️' : '⬜';
+        const exp = calcTournamentExp(999, state.full.has(p.discordId)); // แสดงเฉพาะส่วนพฤติกรรม (ยังไม่รู้อันดับ)
+        text += `${ticked} <@${p.discordId}> — เข้าร่วม ${exp} EXP *(ยังไม่รวมโบนัสอันดับ)*\n`;
+    });
+
+    if (state.noShow.length > 0) {
+        text += `\n🚫 **ไม่ได้ลงแข่งเลย (ไม่ได้ EXP):** ${state.noShow.map(n => n).join(', ')}\n`;
+    }
+
+    text += `\n> อันดับ 1 +50 | อันดับ 2-3 +30 | อันดับ 4-5 +20 | เข้าร่วม +10 | เล่นครบทุกรอบ +10`;
+    return text.substring(0, 1900);
 }
 
 // =========================================================
@@ -197,11 +298,33 @@ let leaderboardInterval = null;
 
 // 3. ฟังก์ชันสร้างบอร์ดจัดอันดับ (Leaderboard)
 async function getLeaderboardEmbed() {
-    // 📌 ลิงก์ Web App URL เดิมของคุณ
-    const GAS_WEB_APP_URL = process.env.BOT_BRIDGE_URL; 
     try {
-        const res = await axios.post(GAS_WEB_APP_URL, { action: "get_leaderboard" }, { headers: { 'x-bot-secret': process.env.BOT_BRIDGE_SECRET } });
-        const players = res.data.data;
+        if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+            console.error("Leaderboard Error: ยังไม่ได้ตั้งค่า SUPABASE_URL / SUPABASE_SERVICE_KEY ใน .env");
+            return null;
+        }
+
+        // 📌 ดึงอันดับจากตาราง customers ใน Supabase (PostgREST) โดยตรง
+        const res = await axios.get(`${SUPABASE_URL}/rest/v1/customers`, {
+            params: {
+                select: 'discord_id,display_name,exp',
+                exp: 'gt.0',
+                discord_id: 'not.is.null',
+                order: 'exp.desc',
+                limit: 20
+            },
+            headers: {
+                apikey: SUPABASE_SERVICE_KEY,
+                Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`
+            }
+        });
+
+        // แปลงรูปแบบข้อมูลให้เหมือนของเดิม (discordId / exp) เพื่อไม่ต้องแก้โค้ดส่วนแสดงผล
+        const players = (res.data || []).map(row => ({
+            discordId: row.discord_id,
+            name: row.display_name,
+            exp: row.exp || 0
+        }));
 
         if (!players || players.length === 0) {
             return new EmbedBuilder()
@@ -649,6 +772,31 @@ client.on('interactionCreate', async interaction => {
         // =========================
         if (interaction.isStringSelectMenu()) {
 
+            // ✅ ติ๊กคนที่เล่นครบทุกรอบ (ก่อนปิดจ็อบ)
+            if (interaction.customId.startsWith('fullplay_')) {
+                if (!interaction.member.permissions.has('ManageMessages')) {
+                    return await interaction.reply({ content: '⛔ เฉพาะแอดมินเท่านั้น', ephemeral: true });
+                }
+
+                const idParts = interaction.customId.split('_');
+                const tid = idParts[1];
+                const chunkIndex = parseInt(idParts[2]);
+                const state = pendingFinish.get(tid);
+
+                if (!state) {
+                    return await interaction.reply({ content: '❌ รายการนี้หมดอายุแล้ว กดปุ่ม "ปิดจ็อบ" ใหม่อีกครั้งครับ', ephemeral: true });
+                }
+
+                // อัปเดตเฉพาะคนในชุดนี้: เอาออกทั้งชุดก่อน แล้วใส่กลับเฉพาะคนที่ถูกติ๊ก
+                state.chunks[chunkIndex].forEach(p => state.full.delete(p.discordId));
+                interaction.values.forEach(id => state.full.add(id));
+
+                return await interaction.update({
+                    content: buildFullPlayText(state),
+                    components: buildFullPlayComponents(tid, state)
+                });
+            }
+
             if (!interaction.customId.startsWith('pollselect_')) return;
 
             const tourneyId = interaction.customId.split('_')[1];
@@ -975,14 +1123,92 @@ client.on('interactionCreate', async interaction => {
       // ==========================================
         // 🏁 FINISH (ปุ่มปิดจ็อบ & บันทึกสถิติ)
         // ==========================================
+        // ขั้นที่ 1: กดปุ่ม "ปิดจ็อบ" → ยังไม่แจก EXP แต่ขึ้นรายการให้แอดมินติ๊กก่อน
         if (action === 'finish') {
-            const COMPETITOR_ROLE_ID = '1476156740738486457'; 
-            const GAS_WEB_APP_URL = process.env.BOT_BRIDGE_URL; 
-
             if (!interaction.member.permissions.has('ManageMessages')) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
 
             try {
-                // 🎯 1. สั่ง Finalize ใน Challonge เป็นอย่างแรก! 
+                const res = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}.json`, {
+                    params: { api_key: CHALLONGE_API_KEY, include_participants: 1, include_matches: 1 }
+                });
+
+                const tournamentName = res.data.tournament.name;
+                const participants = res.data.tournament.participants.map(p => p.participant);
+                const matches = res.data.tournament.matches ? res.data.tournament.matches.map(m => m.match) : [];
+                const playedCount = countMatchesPlayed(matches);
+
+                const players = [];
+                const noShow = [];
+
+                await interaction.guild.members.fetch().catch(() => {});
+
+                participants.forEach(p => {
+                    const idMatch = p.name.match(/<@(\d+)>/);
+                    if (!idMatch) return; // ไม่มี Discord ผูกไว้ ข้ามไป
+                    const discordId = idMatch[1];
+                    const member = interaction.guild.members.cache.get(discordId);
+                    const entry = {
+                        discordId,
+                        challongeId: p.id,
+                        label: p.name.replace(/<@\d+>/, '').trim()
+                            || member?.displayName
+                            || `ผู้เล่น ${p.id}`
+                    };
+                    if ((playedCount[p.id] || 0) > 0) players.push(entry);
+                    else noShow.push(entry.label);
+                });
+
+                if (players.length === 0) {
+                    return await interaction.editReply('⚠️ ไม่พบผู้เล่นที่ลงแข่งจริงและผูก Discord ไว้ ตรวจสอบชื่อผู้เข้าแข่งใน Challonge ครับ');
+                }
+
+                // แบ่งเป็นชุดละ 25 คน (ข้อจำกัดของ Discord select menu) สูงสุด 4 ชุด = 100 คน
+                const chunks = [];
+                for (let i = 0; i < players.length && chunks.length < 4; i += 25) {
+                    chunks.push(players.slice(i, i + 25));
+                }
+
+                const state = {
+                    tournamentName,
+                    players,
+                    noShow,
+                    chunks,
+                    full: new Set(players.map(p => p.discordId)) // ค่าเริ่มต้น: ติ๊กทุกคนไว้ก่อน
+                };
+                pendingFinish.set(tournamentId, state);
+
+                return await interaction.editReply({
+                    content: buildFullPlayText(state),
+                    components: buildFullPlayComponents(tournamentId, state)
+                });
+
+            } catch (error) {
+                console.error("Finish Checklist Error:", error.response?.data || error.message);
+                return await interaction.editReply('❌ ดึงข้อมูลผู้เข้าแข่งไม่สำเร็จ กรุณาตรวจสอบ Log');
+            }
+        }
+
+        // ขั้นที่ 2: ยืนยันแล้ว → finalize + แจก EXP จริง
+        if (action === 'fullcancel') {
+            pendingFinish.delete(tournamentId);
+            return await interaction.editReply('✖️ ยกเลิกการปิดจ็อบแล้ว ยังไม่มีการแจก EXP ครับ');
+        }
+
+        if (action === 'fullall' || action === 'fullconfirm') {
+            const COMPETITOR_ROLE_ID = '1476156740738486457';
+
+            if (!interaction.member.permissions.has('ManageMessages')) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
+
+            const state = pendingFinish.get(tournamentId);
+            if (!state) return await interaction.editReply('❌ รายการนี้หมดอายุแล้ว กดปุ่ม "ปิดจ็อบ" ใหม่อีกครั้งครับ');
+
+            // ปุ่ม "ทุกคนเล่นครบ" = ติ๊กให้ทุกคนอัตโนมัติ
+            const fullPlayedIds = (action === 'fullall')
+                ? new Set(state.players.map(p => p.discordId))
+                : state.full;
+
+            try {
+                // 🎯 1. สั่ง Finalize ใน Challonge เป็นอย่างแรก!
                 // เพื่อให้ระบบคำนวณ final_rank ให้ครบทุกคนก่อนจะดึงข้อมูลไปแจก EXP
                 await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/finalize.json`, {}, {
                     params: { api_key: CHALLONGE_API_KEY }
@@ -1001,23 +1227,37 @@ client.on('interactionCreate', async interaction => {
                 players.sort((a, b) => (a.final_rank || 999) - (b.final_rank || 999));
 
                 let participantsList = "";
-                let playerStats = [];
+                let awards = [];
+                let skippedNoShow = [];
                 const participantMap = {};
+                const playedCount = countMatchesPlayed(matches);
 
-                // 4. วนลูปจับคู่เพื่อส่งให้ GAS
+                // 4. วนลูปคำนวณ EXP รายคน (อันดับ + เข้าร่วม + โบนัสเล่นครบทุกรอบ)
                 players.forEach((participant, index) => {
                     const name = participant.name;
                     // ถึงตรงนี้รับรองว่ามี final_rank แน่นอน 100%
-                    const rank = participant.final_rank || (index + 1); 
+                    const rank = participant.final_rank || (index + 1);
                     const discordIdMatch = name.match(/<@(\d+)>/);
                     const discordId = discordIdMatch ? discordIdMatch[1] : null;
 
                     participantMap[participant.id] = name;
                     participantsList += `${rank}. ${name}\n`;
 
-                    if (discordId) {
-                        playerStats.push({ discordId: discordId, rank: rank });
+                    if (!discordId) return;
+
+                    // สมัครแต่ไม่ได้ลงแข่งเลย = ไม่ได้ EXP
+                    if ((playedCount[participant.id] || 0) === 0) {
+                        skippedNoShow.push(discordId);
+                        return;
                     }
+
+                    const playedAll = fullPlayedIds.has(discordId);
+                    awards.push({
+                        discordId,
+                        rank,
+                        exp: calcTournamentExp(rank, playedAll),
+                        playedAll
+                    });
                 });
 
                 // 5. สรุปแมตช์ที่แข่งมาทั้งหมด
@@ -1030,14 +1270,27 @@ client.on('interactionCreate', async interaction => {
                     matchHistory += `รอบ ${match.round}: ${p1} vs ${p2} | ชนะ: ${winner} (${score})\n`;
                 });
 
-                // 6. ส่งข้อมูลที่ถูกต้องทั้งหมดไปยัง GAS (เพื่อแจก EXP)
-                await axios.post(GAS_WEB_APP_URL, {
-                    action: "finish_tournament",
-                    tournamentName: tournamentName,
-                    participantsList: participantsList.trim(),
-                    matchHistory: matchHistory.trim(),
-                    playerStats: playerStats
-                }, { headers: { 'x-bot-secret': process.env.BOT_BRIDGE_SECRET } });
+                // 6. บันทึกลง Supabase (แจก EXP + ลงประวัติ + อัปสถิติ) ในทีเดียว
+                if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+                    return await interaction.editReply('❌ ยังไม่ได้ตั้งค่า SUPABASE_URL / SUPABASE_SERVICE_KEY ใน .env');
+                }
+
+                const rpcRes = await axios.post(`${SUPABASE_URL}/rest/v1/rpc/bot_finish_tournament`, {
+                    p_tournament_name: tournamentName,
+                    p_participants_list: participantsList.trim(),
+                    p_match_history: matchHistory.trim(),
+                    p_player_count: players.length,
+                    p_awards: awards
+                }, {
+                    headers: {
+                        apikey: SUPABASE_SERVICE_KEY,
+                        Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                const awardedCount = rpcRes.data?.awarded ?? 0;
+                const notFound = rpcRes.data?.skipped || [];
 
                 // 7. เคลียร์ยศนักแข่ง
                 const role = interaction.guild.roles.cache.get(COMPETITOR_ROLE_ID);
@@ -1048,7 +1301,29 @@ client.on('interactionCreate', async interaction => {
                     }
                 }
 
-                return await interaction.editReply(`✅ ปิดงานแข่ง **"${tournamentName}"** เรียบร้อย!\n📊 ระบบแจก EXP ตามขั้นบันได (60/40/30/10) ให้ผู้เล่น ${playerStats.length} คน สำเร็จ!`);
+                pendingFinish.delete(tournamentId);
+
+                // 8. สรุปผลให้แอดมินดูว่าใครได้เท่าไหร่ เพราะอะไร
+                let summary = `✅ ปิดงานแข่ง **"${tournamentName}"** เรียบร้อย!\n📊 แจก EXP ให้ผู้เล่น ${awardedCount} คน\n\n`;
+                awards
+                    .sort((a, b) => a.rank - b.rank)
+                    .slice(0, 25)
+                    .forEach(a => {
+                        const place = getPlacementExp(a.rank);
+                        const detail = [`เข้าร่วม +${EXP_JOIN}`];
+                        if (place > 0) detail.unshift(`อันดับ ${a.rank} +${place}`);
+                        if (a.playedAll) detail.push(`เล่นครบทุกรอบ +${EXP_FULL_PLAY}`);
+                        summary += `${a.playedAll ? '☑️' : '⬜'} <@${a.discordId}> → **${a.exp} EXP** (${detail.join(', ')})\n`;
+                    });
+
+                if (skippedNoShow.length > 0) {
+                    summary += `\n🚫 ไม่ได้ลงแข่งเลย ไม่ได้ EXP: ${skippedNoShow.map(id => `<@${id}>`).join(', ')}`;
+                }
+                if (notFound.length > 0) {
+                    summary += `\n⚠️ ไม่พบบัญชีในเว็บ (ยังไม่ผูก Discord): ${notFound.map(id => `<@${id}>`).join(', ')}`;
+                }
+
+                return await interaction.editReply({ content: summary.substring(0, 1900), components: [] });
 
             } catch (error) {
                 console.error("Finish Error:", error.response?.data || error.message);
