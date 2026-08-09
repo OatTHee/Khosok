@@ -22,6 +22,21 @@ const CHALLONGE_API_KEY = process.env.CHALLONGE_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
+// เช็กว่าตั้งค่า Supabase ครบและเป็นคีย์จริง (ไม่ใช่ข้อความตัวอย่าง) — คืน true ถ้าพร้อมใช้งาน
+function checkSupabaseEnv(label = 'Supabase') {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+        console.error(`❌ [${label}] ยังไม่ได้ตั้งค่า SUPABASE_URL / SUPABASE_SERVICE_KEY ใน .env`);
+        return false;
+    }
+    // service_role key ของจริงจะขึ้นต้นด้วย "eyJ" (JWT) หรือ "sb_secret_"
+    if (!/^(eyJ|sb_secret_)/.test(SUPABASE_SERVICE_KEY)) {
+        console.error(`❌ [${label}] SUPABASE_SERVICE_KEY ยังเป็นข้อความตัวอย่าง ไม่ใช่คีย์จริง`);
+        console.error(`   → ไปที่ Supabase Dashboard > Project Settings > API Keys แล้วคัดลอกคีย์ service_role มาวางใน .env`);
+        return false;
+    }
+    return true;
+}
+
 const client = new Client({ 
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] 
 });
@@ -299,10 +314,7 @@ let leaderboardInterval = null;
 // 3. ฟังก์ชันสร้างบอร์ดจัดอันดับ (Leaderboard)
 async function getLeaderboardEmbed() {
     try {
-        if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-            console.error("Leaderboard Error: ยังไม่ได้ตั้งค่า SUPABASE_URL / SUPABASE_SERVICE_KEY ใน .env");
-            return null;
-        }
+        if (!checkSupabaseEnv('Leaderboard')) return null;
 
         // 📌 ดึงอันดับจากตาราง customers ใน Supabase (PostgREST) โดยตรง
         const res = await axios.get(`${SUPABASE_URL}/rest/v1/customers`, {
@@ -353,7 +365,15 @@ async function getLeaderboardEmbed() {
             .setTimestamp();
 
     } catch (error) {
-        console.error("Leaderboard Error:", error);
+        // แสดง log ให้รู้ว่าพังเพราะอะไร จะได้แก้ถูกจุด
+        if (error.response) {
+            console.error(`Leaderboard Error: HTTP ${error.response.status}`, error.response.data);
+            if (error.response.status === 401) {
+                console.error('   → คีย์ไม่ถูกต้อง/หมดอายุ ต้องใช้ service_role key เท่านั้น (anon key จะโดน RLS บล็อก)');
+            }
+        } else {
+            console.error("Leaderboard Error:", error.message);
+        }
         return null;
     }
 }
@@ -1271,8 +1291,8 @@ client.on('interactionCreate', async interaction => {
                 });
 
                 // 6. บันทึกลง Supabase (แจก EXP + ลงประวัติ + อัปสถิติ) ในทีเดียว
-                if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-                    return await interaction.editReply('❌ ยังไม่ได้ตั้งค่า SUPABASE_URL / SUPABASE_SERVICE_KEY ใน .env');
+                if (!checkSupabaseEnv('Finish')) {
+                    return await interaction.editReply('❌ ยังไม่ได้ตั้งค่า SUPABASE_SERVICE_KEY (service_role key) ใน .env — ยังแจก EXP ไม่ได้');
                 }
 
                 const rpcRes = await axios.post(`${SUPABASE_URL}/rest/v1/rpc/bot_finish_tournament`, {
