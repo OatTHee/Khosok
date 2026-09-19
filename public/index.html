@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Khosok · จัดทัวร์</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦖</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/"><span class="brand-mark">🦖</span> Khosok <span class="brand-sub">จัดทัวร์</span></a>
+  <div class="topbar-right" id="userbox" hidden>
+    <span id="username" class="muted"></span>
+    <button class="btn ghost sm" id="logout">ออกจากระบบ</button>
+  </div>
+</header>
+<main id="app" class="container"><div class="loading">กำลังโหลด…</div></main>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<dialog id="dialog"><form method="dialog" id="dialog-body"></form></dialog>
+<script src="/vendor/supabase.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

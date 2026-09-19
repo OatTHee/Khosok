@@ -1,19 +1,24 @@
 {
   "name": "bot_dmt_khosok",
   "version": "1.0.0",
-  "description": "",
+  "description": "Khosok: บอท Discord + เว็บจัดทัวร์ Dinomaster",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "test": "node --test test/*.test.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@supabase/supabase-js": "^2.116.0",
     "axios": "^1.13.5",
     "discord.js": "^14.25.1",
     "dotenv": "^17.3.1",
     "express": "^5.2.1"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

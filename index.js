@@ -1,18 +1,24 @@
-require('dotenv').config(); // [เพิ่มบรรทัดนี้] เพื่อให้บอทอ่านค่าจากไฟล์ .env ได้
+require('dotenv').config(); // อ่านค่าจากไฟล์ .env (บน Render ตั้งใน Environment แทน)
 
 const express = require('express');
 const app = express();
-app.get('/', (req, res) => res.send('Khosok is Online! 🟢'));
+app.set('trust proxy', 1);
+app.get('/health', (req, res) => res.send('Khosok is Online! 🟢'));
+// 🌐 เว็บจัดทัวร์ + API อยู่ในเซิร์ฟเวอร์เดียวกับบอท (ดู web/api.js)
+require('./web/api').mountWeb(app);
 app.listen(process.env.PORT || 3000, '0.0.0.0', () => {
-    console.log('เซิร์ฟเวอร์จำลองเริ่มทำงานแล้ว พร้อมรับการปลุก!');
+    console.log('เซิร์ฟเวอร์เริ่มทำงานแล้ว (เว็บจัดทัวร์ + บอท)');
 });
 
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
 const axios = require('axios');
 axios.defaults.timeout = 8000; // ตัดจบถ้านานเกิน 8 วินาที
-const tournamentTimers = new Map(); // หน่วยความจำสำหรับเก็บเวลาหมดรอบ
+const T = require('./tournament/service'); // 🏟️ ระบบทัวร์นาเมนต์ของเราเอง (แทน Challonge)
+const TE = require('./tournament/engine');
 const activePolls = new Map();
 const pendingFinish = new Map(); // เก็บสถานะ "ติ๊กคนเล่นครบทุกรอบ" ก่อนกดยืนยันปิดจ็อบ
+const COMPETITOR_ROLE_ID = '1476156740738486457';
+
 
 // =========================================================
 // 🔐 กันคีย์หลุดใน log
@@ -22,7 +28,6 @@ const pendingFinish = new Map(); // เก็บสถานะ "ติ๊กค
 const util = require('util');
 const SECRET_VALUES = [
     process.env.DISCORD_TOKEN,
-    process.env.CHALLONGE_API_KEY,
     process.env.SUPABASE_SERVICE_KEY,
     process.env.BOT_BRIDGE_SECRET,
     process.env.BOT_BRIDGE_URL,
@@ -66,62 +71,7 @@ for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
     console[level] = (...args) => original(redact(util.format(...args)));
 }
 
-// =========================================================
-// ⚡ Cache สั้นๆ ของข้อมูลทัวร์นาเมนต์ (กันยิง Challonge ซ้ำภายในไม่กี่วินาที)
-// - ภายใน TTL จะคืนข้อมูลเดิม, ถ้ามีคำขอเดิมกำลังวิ่งอยู่จะรอผลเดียวกัน (ไม่ยิงซ้ำ)
-// - ถ้าโดน 429 จะจำเวลาพักไว้ ไม่ยิงเพิ่มจนกว่าจะพ้นเวลา Retry-After
-// =========================================================
-const TOURNEY_CACHE_TTL_MS = 5000;
-const tourneyCache = new Map(); // key -> { at, data } หรือ { promise }
-let challongeCooldownUntil = 0;
-
-function parseRetryAfterSec(value) {
-    if (value === undefined || value === null || value === '') return null;
-    const n = Number(value);
-    if (Number.isFinite(n)) return Math.max(1, Math.ceil(n));
-    const dateMs = Date.parse(value);
-    if (!Number.isNaN(dateMs)) return Math.max(1, Math.ceil((dateMs - Date.now()) / 1000));
-    return null;
-}
-
-async function getTournamentFull(tournamentId) {
-    const key = String(tournamentId).trim().toLowerCase();
-    const now = Date.now();
-
-    for (const [k, v] of tourneyCache) if (v.at && now - v.at >= TOURNEY_CACHE_TTL_MS) tourneyCache.delete(k);
-
-    const hit = tourneyCache.get(key);
-    if (hit?.promise) return structuredClone(await hit.promise);
-    if (hit?.data) return structuredClone(hit.data);
-
-    if (now < challongeCooldownUntil) {
-        const err = new Error('Challonge rate limit cooldown (local)');
-        err.response = { status: 429, headers: { 'retry-after': String(Math.ceil((challongeCooldownUntil - now) / 1000)) } };
-        err.fromLocalCooldown = true;
-        throw err;
-    }
-
-    const promise = axios.get(`https://api.challonge.com/v1/tournaments/${encodeURIComponent(tournamentId)}.json`, {
-        params: { api_key: CHALLONGE_API_KEY, include_participants: 1, include_matches: 1 }
-    }).then(res => {
-        tourneyCache.set(key, { at: Date.now(), data: res.data });
-        return res.data;
-    }).catch(err => {
-        tourneyCache.delete(key);
-        if (err.response?.status === 429) {
-            const sec = parseRetryAfterSec(err.response.headers?.['retry-after']) ?? 60;
-            challongeCooldownUntil = Date.now() + sec * 1000;
-        }
-        throw err;
-    });
-
-    tourneyCache.set(key, { promise });
-    return structuredClone(await promise);
-}
-
-// กำหนดค่าต่างๆ ของคุณที่นี่ (ดึงจาก Environment Variables ปลอดภัย 100%)
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const CHALLONGE_API_KEY = process.env.CHALLONGE_API_KEY;
 
 // 🟢 Supabase (ฐานข้อมูลใหม่ แทน Google Sheet)
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -170,47 +120,23 @@ function getTitleByExp(exp) {
 }
 
 // =========================================================
-// ✨ สูตรคำนวณ EXP หลังจบงานแข่ง (แก้ที่นี่จุดเดียว)
-//    เข้าร่วม (ลงแข่งอย่างน้อย 1 ตา)      = +10
-//    เล่นครบทุกรอบ (แอดมินติ๊ก)           = +10
-//    อันดับ 1 (แชมป์)                     = +50  → ครบทุกรอบ = 70
-//    อันดับ 2-3 (Top 3)                   = +30  → ครบทุกรอบ = 50
-//    อันดับ 4-5 (Top 5)                   = +20  → ครบทุกรอบ = 40
+// 📐 เกณฑ์ EXP (ตัวจริงอยู่ที่ tournament/engine.js ที่เดียว)
 // =========================================================
-const EXP_JOIN = 10;
-const EXP_FULL_PLAY = 10;
-
-function getPlacementExp(rank) {
-    if (rank === 1) return 50;
-    if (rank <= 3) return 30;
-    if (rank <= 5) return 20;
-    return 0;
-}
-
-function calcTournamentExp(rank, playedAll) {
-    return getPlacementExp(rank) + EXP_JOIN + (playedAll ? EXP_FULL_PLAY : 0);
-}
-
-// นับจำนวนแมตช์ที่ "แข่งจบจริง" ของผู้เล่นแต่ละคน (ใช้คัดคนที่สมัครแต่ไม่ได้ลงเลยออก)
-function countMatchesPlayed(matches) {
-    const played = {};
-    matches.forEach(m => {
-        if (m.state !== 'complete') return;
-        if (m.player1_id) played[m.player1_id] = (played[m.player1_id] || 0) + 1;
-        if (m.player2_id) played[m.player2_id] = (played[m.player2_id] || 0) + 1;
-    });
-    return played;
-}
+const EXP_JOIN = TE.EXP_JOIN;
+const EXP_FULL_PLAY = TE.EXP_FULL_PLAY;
+const getPlacementExp = TE.placementExp;
+const calcTournamentExp = TE.calcExp;
 
 // =========================================================
 // 🗳️ สร้างหน้าจอติ๊ก "ใครเล่นครบทุกรอบ" ก่อนแจก EXP
+// state.players = [{ id, label }] (id = player id ในระบบทัวร์)
 // =========================================================
-function buildFullPlayComponents(tournamentId, state) {
+function buildFullPlayComponents(code, state) {
     const rows = [];
 
     state.chunks.forEach((chunk, chunkIndex) => {
         const menu = new StringSelectMenuBuilder()
-            .setCustomId(`fullplay_${tournamentId}_${chunkIndex}`)
+            .setCustomId(`fullplay_${code}_${chunkIndex}`)
             .setPlaceholder(`✅ ติ๊กคนที่เล่นครบทุกรอบ (ชุดที่ ${chunkIndex + 1})`)
             .setMinValues(0)
             .setMaxValues(chunk.length)
@@ -218,29 +144,17 @@ function buildFullPlayComponents(tournamentId, state) {
                 chunk.map(p =>
                     new StringSelectMenuOptionBuilder()
                         .setLabel(p.label.substring(0, 100))
-                        .setValue(p.discordId)
-                        .setDefault(state.full.has(p.discordId))
+                        .setValue(p.id)
+                        .setDefault(state.full.has(p.id))
                 )
             );
         rows.push(new ActionRowBuilder().addComponents(menu));
     });
 
     rows.push(new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId(`fullall_${tournamentId}`)
-            .setLabel('ทุกคนเล่นครบ')
-            .setStyle(ButtonStyle.Success)
-            .setEmoji('✅'),
-        new ButtonBuilder()
-            .setCustomId(`fullconfirm_${tournamentId}`)
-            .setLabel('ยืนยัน & ปิดจ็อบ')
-            .setStyle(ButtonStyle.Danger)
-            .setEmoji('🏁'),
-        new ButtonBuilder()
-            .setCustomId(`fullcancel_${tournamentId}`)
-            .setLabel('ยกเลิก')
-            .setStyle(ButtonStyle.Secondary)
-            .setEmoji('✖️')
+        new ButtonBuilder().setCustomId(`fullall_${code}`).setLabel('ทุกคนเล่นครบ').setStyle(ButtonStyle.Success).setEmoji('✅'),
+        new ButtonBuilder().setCustomId(`fullconfirm_${code}`).setLabel('ยืนยัน & ปิดจ็อบ').setStyle(ButtonStyle.Danger).setEmoji('🏁'),
+        new ButtonBuilder().setCustomId(`fullcancel_${code}`).setLabel('ยกเลิก').setStyle(ButtonStyle.Secondary).setEmoji('✖️')
     ));
 
     return rows;
@@ -248,16 +162,16 @@ function buildFullPlayComponents(tournamentId, state) {
 
 function buildFullPlayText(state) {
     let text = `📝 **ให้คะแนนพฤติกรรมก่อนแจก EXP — ${state.tournamentName}**\n`;
-    text += `ติ๊กเฉพาะคนที่ **อยู่เล่นครบทุกรอบ** (ค่าเริ่มต้นติ๊กไว้ให้ทุกคนแล้ว ถ้าใครกลับก่อน/ไม่ครบ ให้เอาติ๊กออก)\n\n`;
+    text += `ติ๊กเฉพาะคนที่ **อยู่เล่นครบทุกรอบ** (ค่าเริ่มต้นติ๊กไว้ให้ทุกคนที่ไม่ได้ถอนตัว ถ้าใครกลับก่อน/ไม่ครบ ให้เอาติ๊กออก)\n\n`;
 
     state.players.forEach(p => {
-        const ticked = state.full.has(p.discordId) ? '☑️' : '⬜';
-        const exp = calcTournamentExp(999, state.full.has(p.discordId)); // แสดงเฉพาะส่วนพฤติกรรม (ยังไม่รู้อันดับ)
-        text += `${ticked} <@${p.discordId}> — เข้าร่วม ${exp} EXP *(ยังไม่รวมโบนัสอันดับ)*\n`;
+        const full = state.full.has(p.id);
+        const exp = calcTournamentExp(p.rank, full);
+        text += `${full ? '☑️' : '⬜'} ${p.rank}. ${p.mention} → **${exp} EXP**${p.linked ? '' : ' *(walk-in ไม่ได้รับ)*'}\n`;
     });
 
     if (state.noShow.length > 0) {
-        text += `\n🚫 **ไม่ได้ลงแข่งเลย (ไม่ได้ EXP):** ${state.noShow.map(n => n).join(', ')}\n`;
+        text += `\n🚫 **ไม่ได้ลงแข่งเลย (ไม่ได้ EXP):** ${state.noShow.join(', ')}\n`;
     }
 
     text += `\n> อันดับ 1 +50 | อันดับ 2-3 +30 | อันดับ 4-5 +20 | เข้าร่วม +10 | เล่นครบทุกรอบ +10`;
@@ -265,152 +179,187 @@ function buildFullPlayText(state) {
 }
 
 // =========================================================
-// โซนฟังก์ชันตัวช่วย (Helper Functions)
-// วางไว้ด้านนอกสุด เพื่อให้ทุกระบบเรียกใช้ได้
+// โซนฟังก์ชันตัวช่วย (Helper Functions) — อ่านจากระบบทัวร์ของเราเอง
 // =========================================================
+const mentionOf = p => (p.discord_id ? `<@${p.discord_id}>` : `**${p.display_name}**`);
+const thTime = iso => new Date(iso).toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit' }).replace(':', '.');
 
-// 1. ฟังก์ชันสร้างบอร์ดรับสมัคร (โชว์จำนวนคน + ข้อความเชิญชวน)
-async function getSetupEmbed(tournamentId) {
-    try {
-        const res = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}.json`, {
-            params: { api_key: CHALLONGE_API_KEY, include_participants: 1 }
-        });
-        
-        const tournamentData = res.data.tournament;
-        const tName = tournamentData.name;
-        const participantCount = tournamentData.participants.length;
+// 1. บอร์ดรับสมัคร (โชว์จำนวนคน + ข้อความเชิญชวน)
+function buildSetupEmbed(v) {
+    const t = v.tournament;
+    const count = v.players.length;
+    const startTimeText = t.start_at ? `งานเริ่มเวลา ${thTime(t.start_at)} น.` : 'ยังไม่กำหนดเวลาเริ่ม';
 
-        // 🕒 จัดการดึงและแปลงเวลาเริ่มแข่ง
-        let startTimeText = "ยังไม่กำหนดเวลาเริ่ม";
-        if (tournamentData.start_at) {
-            const startDate = new Date(tournamentData.start_at);
-            const timeString = startDate.toLocaleTimeString('th-TH', {
-                timeZone: 'Asia/Bangkok',
-                hour: '2-digit',
-                minute: '2-digit'
-            }).replace(':', '.'); 
-            startTimeText = `งานเริ่มเวลา ${timeString} น.`;
-        }
-
+    if (t.status !== 'registration') {
         return new EmbedBuilder()
-            .setTitle(`เปิดรับสมัคร: ${tName}`)
-            .setDescription(`# ${startTimeText}\n\n📊 **จำนวนผู้สมัครปัจจุบัน:**\n# 👤 ${participantCount} คน\n\n🔥 **เป้าหมายพิเศษ:**\nหากมีผู้เข้าแข่งขันถึง **10 คน** ระบบจะขยายโควต้าแจกรางวัล 5 แต้ม ให้สูงสุดถึง **Top 5!** มาร่วมสนุกกันเยอะๆ นะครับ!\n\nกดปุ่มด้านล่างเพื่อสมัคร หรือสละสิทธิ์\n(เฉพาะแอดมินเท่านั้นที่กดปุ่มเริ่มแข่งได้)`)
-            .setColor(0x00FF00); // สีเขียว
-    } catch (error) {
-        console.error(error);
-        return null;
+            .setTitle(`ปิดรับสมัครแล้ว: ${t.name}`)
+            .setDescription(`👤 ผู้เข้าแข่งขันทั้งหมด **${count}** คน\n${t.status === 'running' ? '⚔️ การแข่งขันเริ่มแล้ว ดูคู่ของคุณในโพสต์ถัดไป' : t.status === 'finished' ? '🏁 งานนี้จบแล้ว' : '❌ งานนี้ถูกยกเลิก'}`)
+            .setColor(0x808080)
+            .setFooter({ text: `งาน #${t.code}` });
     }
+
+    const names = v.players.slice(0, 40).map((p, i) => `${i + 1}. ${p.display_name}`).join('\n');
+    return new EmbedBuilder()
+        .setTitle(`เปิดรับสมัคร: ${t.name}`)
+        .setDescription(`# ${startTimeText}\n\n📊 **จำนวนผู้สมัครปัจจุบัน:**\n# 👤 ${count} คน\n\n🔥 **เป้าหมายพิเศษ:**\nหากมีผู้เข้าแข่งขันถึง **10 คน** ระบบจะขยายโควต้าแจกรางวัลให้สูงสุดถึง **Top 5!** มาร่วมสนุกกันเยอะๆ นะครับ!\n\nกดปุ่มด้านล่างเพื่อสมัคร หรือสละสิทธิ์\n(เฉพาะแอดมินเท่านั้นที่กดปุ่มเริ่มแข่งได้)${names ? `\n\n**รายชื่อ**\n${names}` : ''}`.substring(0, 4000))
+        .setColor(0x00FF00)
+        .setFooter({ text: `งาน #${t.code} • ${t.format === 'single_elim' ? 'แพ้คัดออก' : 'Swiss'}` });
 }
 
-// 2. ฟังก์ชันดึงสถานะปัจจุบันแบบอัจฉริยะ (โชว์คู่ล่วงหน้า + คนได้บาย + จับเวลา)
-async function getCurrentEmbed(tournamentId, endTimeMs) {
-    try {
-        const res = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}.json`, {
-            params: { api_key: CHALLONGE_API_KEY, include_participants: 1, include_matches: 1 }
-        });
+function setupButtons(code) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`register_${code}`).setLabel('สมัครแข่ง').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`leave_${code}`).setLabel('สละสิทธิ์').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`start_${code}`).setLabel('ปิดรับสมัคร & เริ่มแข่ง').setStyle(ButtonStyle.Primary)
+    );
+}
 
-        const tournamentData = res.data.tournament;
-        const participants = tournamentData.participants;
-        const matches = tournamentData.matches;
+// 2. สถานะรอบปัจจุบัน (คู่ + คนได้บาย + จับเวลา)
+function buildCurrentEmbed(v) {
+    const t = v.tournament;
+    const name = Object.fromEntries(v.players.map(p => [p.id, p]));
+    const who = id => (name[id] ? name[id].display_name : '*[รอผู้ชนะ]*');
+    let text = '';
 
-        const playerMap = {};
-        participants.forEach(p => { playerMap[p.participant.id] = p.participant.name; });
+    if (t.round_ends_at) {
+        const unix = Math.floor(new Date(t.round_ends_at).getTime() / 1000);
+        text += `**หมดเวลาแข่งขัน:** ${thTime(t.round_ends_at)} น. ( <t:${unix}:R> )\n\n`;
+    } else if (t.status === 'running') {
+        text += `**หมดเวลาแข่งขัน:** 🕒 *ยังไม่เริ่มจับเวลา (รอแอดมินกดปุ่ม)*\n\n`;
+    }
 
-        let currentRound = 1;
-        const activeMatches = matches.filter(m => m.match.state !== 'complete');
-        if (activeMatches.length > 0) {
-            currentRound = Math.min(...activeMatches.map(m => m.match.round));
-        } else if (matches.length > 0) {
-            currentRound = Math.max(...matches.map(m => m.match.round));
-        }
+    const round = v.currentRound;
+    const rm = v.matches.filter(m => m.round === round).sort((a, b) => a.slot - b.slot);
+    const real = rm.filter(m => !m.is_bye);
+    const byes = rm.filter(m => m.is_bye);
 
-        const roundMatches = matches.filter(m => m.match.round === currentRound);
-        const advanceMatches = matches.filter(m => m.match.round > currentRound && m.match.state === 'open');
+    const label = t.format === 'single_elim'
+        ? (round === v.totalRounds ? 'รอบชิงชนะเลิศ' : round === v.totalRounds - 1 ? 'รอบรองชนะเลิศ' : `รอบที่ ${round}`)
+        : `รอบที่ ${round} / ${v.totalRounds}`;
+    text += `**--- ${label} ---**\n`;
+    if (real.length === 0) text += `ไม่มีแมตช์ในรอบนี้\n`;
 
-        const playingNowIds = new Set();
-        [...roundMatches, ...advanceMatches].forEach(m => {
-            if (m.match.player1_id) playingNowIds.add(m.match.player1_id);
-            if (m.match.player2_id) playingNowIds.add(m.match.player2_id);
-        });
-
-        const byePlayers = [];
-        const futurePending = matches.filter(m => m.match.round > currentRound && m.match.state === 'pending');
-        futurePending.forEach(m => {
-            if (m.match.player1_id && !playingNowIds.has(m.match.player1_id)) {
-                byePlayers.push(playerMap[m.match.player1_id]);
-                playingNowIds.add(m.match.player1_id);
-            }
-            if (m.match.player2_id && !playingNowIds.has(m.match.player2_id)) {
-                byePlayers.push(playerMap[m.match.player2_id]);
-                playingNowIds.add(m.match.player2_id);
-            }
-        });
-
-        let matchText = '';
-        
-        if (endTimeMs) {
-            const endDate = new Date(endTimeMs);
-            const timeString = endDate.toLocaleTimeString('th-TH', { 
-                timeZone: 'Asia/Bangkok', 
-                hour: '2-digit', 
-                minute: '2-digit' 
-            }).replace(':', '.'); 
-            
-            const unixSeconds = Math.floor(endTimeMs / 1000);
-            matchText += `**หมดเวลาแข่งขัน:** ${timeString} น. ( <t:${unixSeconds}:R> )\n\n`;
+    let table = 1;
+    real.forEach(m => {
+        const p1 = who(m.player1_id), p2 = who(m.player2_id);
+        const score = m.score1 !== null && m.score2 !== null ? ` (${m.score1}-${m.score2})` : '';
+        if (m.status === 'complete') {
+            text += `**โต๊ะ ${table++}** | ✅ ~~${p1} vs ${p2}~~ 🏆 **${who(m.winner_id)}** ชนะ${score}\n\n`;
+        } else if (m.status === 'open') {
+            text += `**โต๊ะ ${table++}** | ⚔️ **${p1}** VS **${p2}**\n\n`;
         } else {
-            matchText += `**หมดเวลาแข่งขัน:** 🕒 *ยังไม่เริ่มจับเวลา (รอแอดมินกดปุ่ม)*\n\n`;
+            text += `**โต๊ะ ${table++}** | 🕒 ${p1} VS ${p2} *(รอคู่แข่ง)*\n\n`;
         }
+    });
 
-        let tableNum = 1;
-
-        matchText += `**--- รอบที่ ${currentRound} ---**\n`;
-        if (roundMatches.length === 0) matchText += `ไม่มีแมตช์ในรอบนี้\n`;
-        roundMatches.forEach(m => {
-            const match = m.match;
-            const p1 = playerMap[match.player1_id] || '*[รอผู้ชนะ]*';
-            const p2 = playerMap[match.player2_id] || '*[รอผู้ชนะ]*';
-            const scores = match.scores_csv || '0-0';
-
-            if (match.state === 'complete') {
-                const winnerName = playerMap[match.winner_id];
-                matchText += `**โต๊ะ ${tableNum++}** | ✅ ~~${p1} vs ${p2}~~ 🏆 **${winnerName}** ชนะ (${scores})\n\n`;
-            } else if (match.state === 'open') {
-                matchText += `**โต๊ะ ${tableNum++}** | ⚔️ **${p1}** VS **${p2}**\n\n`;
-            } else {
-                matchText += `**โต๊ะ ${tableNum++}** | 🕒 ${p1} VS ${p2} *(รอดำเนินการ)*\n\n`;
-            }
-        });
-
-        if (advanceMatches.length > 0) {
-            matchText += `**--- แมตช์ล่วงหน้า (สามารถแข่งพร้อมกันได้เลย) ---**\n`;
-            advanceMatches.forEach(m => {
-                const match = m.match;
-                const p1 = playerMap[match.player1_id];
-                const p2 = playerMap[match.player2_id];
-                matchText += `**โต๊ะ ${tableNum++}** | ⚔️ **${p1}** VS **${p2}** *(คู่จากรอบที่ ${match.round})*\n\n`;
-            });
-        }
-
-        if (byePlayers.length > 0) {
-            matchText += `**--- ผู้เล่นที่ได้สิทธิ์ชนะบาย (รอแข่งรอบถัดไป) ---**\n`;
-            matchText += `🎉 ${byePlayers.map(name => `**${name}**`).join(', ')}\n\n`;
-        }
-
-        if (!matchText) matchText = 'ยังไม่มีข้อมูลการประกบคู่ครับ';
-
-        return new EmbedBuilder()
-            .setTitle(`🏆 สถานะการจับคู่ปัจจุบัน: ${tournamentData.name}`)
-            .setDescription(matchText)
-            .setColor(0x00FFFF)
-            .setFooter({ text: 'ดึงข้อมูลและจัดโต๊ะเรียลไทม์อัตโนมัติ' })
-            .setTimestamp();
-
-    } catch (error) {
-        console.error(error);
-        return new EmbedBuilder().setDescription('❌ ไม่สามารถโหลดข้อมูลสายการแข่งขันได้');
+    if (byes.length > 0) {
+        text += `**--- ผู้เล่นที่ได้สิทธิ์ชนะบาย ---**\n🎉 ${byes.map(m => `**${who(m.player1_id || m.player2_id)}**`).join(', ')}\n\n`;
     }
+    if (t.status === 'finished') text += `🏁 **งานนี้จบแล้ว** พิมพ์ \`!standing ${t.code}\` เพื่อดูอันดับ`;
+
+    return new EmbedBuilder()
+        .setTitle(`🏆 สถานะการจับคู่ปัจจุบัน: ${t.name}`)
+        .setDescription(text.substring(0, 4000) || 'ยังไม่มีข้อมูลการประกบคู่ครับ')
+        .setColor(0x00FFFF)
+        .setFooter({ text: `งาน #${t.code} • อัปเดตอัตโนมัติเมื่อกรอกผลจากเว็บ` })
+        .setTimestamp();
 }
+
+function currentButtons(v) {
+    const t = v.tournament;
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`timer_${t.code}`).setLabel(`เริ่มจับเวลา ${t.round_minutes} นาที`).setStyle(ButtonStyle.Primary).setEmoji('⏱️'),
+        new ButtonBuilder().setCustomId(`update_${t.code}`).setLabel('อัปเดตผลล่าสุด').setStyle(ButtonStyle.Secondary).setEmoji('🔄')
+    );
+}
+
+// 3. ตารางคะแนน
+function buildStandingEmbed(v) {
+    const t = v.tournament;
+    const done = t.status === 'finished';
+    let text = `ผู้เข้าร่วมทั้งหมด: **${v.players.length}** คน (โควตาแจกแต้ม: **Top ${v.pointsQuota}**)\n`;
+    text += done ? `**🏁 ทัวร์นาเมนต์นี้จบการแข่งขันแล้ว 🏁**\n\n` : `รอบ ${v.currentRound} / ${v.totalRounds}\n\n`;
+
+    v.standings.forEach(s => {
+        const reward = s.points ? `🎁 *(${s.points} แต้ม)*` : '';
+        const tag = s.forfeit ? ' *(ถอนตัว)*' : '';
+        const line = `${s.name}${tag} (ชนะ ${s.wins} แพ้ ${s.losses})`;
+        if (s.rank === 1) text += `🥇 **อันดับ 1 : ${line}** ${reward}\n`;
+        else if (s.rank === 2) text += `🥈 **อันดับ 2 : ${line}** ${reward}\n`;
+        else if (s.rank === 3) text += `🥉 **อันดับ 3 : ${line}** ${reward}\n`;
+        else text += `🔹 อันดับ ${s.rank} : ${line} ${reward}\n`;
+    });
+
+    return new EmbedBuilder()
+        .setTitle(done ? `📊 สรุปตารางคะแนน (ปิดจ็อบแล้ว)` : `📊 สรุปตารางคะแนนล่าสุด`)
+        .setDescription(text.substring(0, 4000))
+        .setColor(done ? 0x00FF00 : 0xFFD700)
+        .setFooter({ text: `${t.name} • งาน #${t.code}` });
+}
+
+// ข้อความ error ที่อ่านรู้เรื่อง (ServiceError เป็นภาษาไทยอยู่แล้ว)
+function errText(error) {
+    if (error instanceof T.ServiceError) return error.message;
+    console.error('[tournament]', error?.message || error);
+    return 'เกิดข้อผิดพลาด ลองใหม่อีกครั้ง';
+}
+
+// ---------------------------------------------------------
+// 🔔 อัปเดตบอร์ดใน Discord อัตโนมัติ เมื่อมีการเปลี่ยนแปลง (จากเว็บหรือจากปุ่มในบอท)
+// ---------------------------------------------------------
+async function fetchBoardChannel(t) {
+    if (!t.discord_channel_id || !client.isReady()) return null;
+    return client.channels.fetch(t.discord_channel_id).catch(() => null);
+}
+
+async function refreshSetupBoard(t) {
+    const channel = await fetchBoardChannel(t);
+    if (!channel || !t.setup_message_id) return;
+    const v = await T.view(t.id);
+    const msg = await channel.messages.fetch(t.setup_message_id).catch(() => null);
+    if (!msg) return;
+    await msg.edit({ embeds: [buildSetupEmbed(v)], components: v.tournament.status === 'registration' ? [setupButtons(t.code)] : [] }).catch(() => {});
+}
+
+async function refreshCurrentBoard(t) {
+    const channel = await fetchBoardChannel(t);
+    if (!channel || !t.current_message_id) return;
+    const v = await T.view(t.id);
+    const msg = await channel.messages.fetch(t.current_message_id).catch(() => null);
+    if (!msg) return;
+    await msg.edit({ embeds: [buildCurrentEmbed(v)], components: v.tournament.status === 'running' ? [currentButtons(v)] : [] }).catch(() => {});
+}
+
+async function postCurrentBoard(channel, idOrCode) {
+    const v = await T.view(idOrCode);
+    const msg = await channel.send({ content: `อัปเดตสถานะการแข่งขันล่าสุด 📢`, embeds: [buildCurrentEmbed(v)], components: [currentButtons(v)] });
+    await T.setDiscordRefs(v.tournament.id, { discord_channel_id: channel.id, current_message_id: msg.id });
+    return msg;
+}
+
+const safeAsync = fn => (...args) => Promise.resolve(fn(...args)).catch(e => console.error('[discord sync]', e?.message || e));
+T.events.on('players', safeAsync(async t => { const fresh = await T.getTournament(t.id); await refreshSetupBoard(fresh); }));
+T.events.on('tournament', safeAsync(async t => { await refreshSetupBoard(t); }));
+T.events.on('round', safeAsync(async (t, round) => {
+    const fresh = await T.getTournament(t.id);
+    if (round === 1) await refreshSetupBoard(fresh);
+    const channel = await fetchBoardChannel(fresh);
+    if (channel) await postCurrentBoard(channel, fresh.id);
+}));
+T.events.on('match', safeAsync(async t => { await refreshCurrentBoard(await T.getTournament(t.id)); }));
+T.events.on('timer', safeAsync(async t => { await refreshCurrentBoard(t); }));
+T.events.on('finished', safeAsync(async t => {
+    const fresh = await T.getTournament(t.id);
+    await refreshCurrentBoard(fresh);
+    // เคลียร์ยศนักแข่งหลังจบงาน
+    const channel = await fetchBoardChannel(fresh);
+    const guild = channel?.guild;
+    if (!guild) return;
+    await guild.members.fetch().catch(() => {});
+    const role = guild.roles.cache.get(COMPETITOR_ROLE_ID);
+    if (role) for (const [, member] of role.members) await member.roles.remove(COMPETITOR_ROLE_ID).catch(() => {});
+}));
+
 
 // ประกาศตัวแปรเก็บข้อความ Leaderboard เพื่อใช้อัปเดตอัตโนมัติ
 let activeLeaderboardMessage = null;
@@ -509,13 +458,13 @@ client.on('messageCreate', async message => {
             .setTitle('🛠️ คู่มือแอดมิน: จัดแข่ง Dinomaster')
             .setColor(0x0099FF)
             .addFields(
-                { name: ' เปิดรับสมัคร', value: 'พิมพ์ `!setup <ID>`' },
-                { name: ' โชว์สถานะล่าสุด (อัจฉริยะ)', value: 'พิมพ์ `!current <ID>`\n*(โชว์รอบปัจจุบัน, แมตช์ล่วงหน้า และคนได้บาย)*' },
-                { name: ' โชว์อันดับงานแข่ง', value: 'พิมพ์ `!standing <ID>`' },
-                { name: ' เปิดโพลล์ทายแชมป์', value: 'พิมพ์ `!pollchamp <ID>`' },
+                { name: ' 🌐 เว็บจัดทัวร์', value: `สร้างงาน / กรอกผล / จับคู่รอบถัดไป ที่ ${process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || 'เว็บของบอท (ลิงก์ Render)'}` },
+                { name: ' เปิดรับสมัคร', value: 'พิมพ์ `!setup <เลขงาน>` เช่น `!setup 12`' },
+                { name: ' โชว์คู่รอบปัจจุบัน + จับเวลา', value: 'พิมพ์ `!current <เลขงาน>`\n*(จับคู่รอบใหม่จากเว็บ บอทจะโพสต์ให้เอง)*' },
+                { name: ' โชว์อันดับงานแข่ง', value: 'พิมพ์ `!standing <เลขงาน>`' },
+                { name: ' เปิดโพลล์ทายแชมป์', value: 'พิมพ์ `!pollchamp <เลขงาน>`' },
                 { name: ' เปิด Leaderboard เซิฟ', value: 'พิมพ์ `!dmtrank`' },
                 { name: ' โชว์โปรไฟล์ตัวเอง', value: 'พิมพ์ `!dmtprof`' },
-
             )
             .setFooter({ text: 'คำสั่งถูกซ่อนอัตโนมัติเพื่อความสะอาดของช่อง' });
         
@@ -525,212 +474,64 @@ client.on('messageCreate', async message => {
     }
 
     if (command === '!setup') {
-        const tournamentId = message.content.split(' ')[1];
-        if (!tournamentId) return message.reply('กรุณาระบุ ID ทัวร์นาเมนต์ด้วยครับ เช่น !setup m1neoxux');
+        if (!tournamentId) return message.reply('กรุณาระบุเลขงานด้วยครับ เช่น `!setup 12` (ดูเลขงานได้ที่เว็บจัดทัวร์)');
 
         try {
-            const setupEmbed = await getSetupEmbed(tournamentId);
-            if (!setupEmbed) return message.channel.send('ไม่พบทัวร์นาเมนต์นี้ใน Challonge หรือใส่ ID ผิดครับ');
-
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId(`register_${tournamentId}`).setLabel('สมัครแข่ง').setStyle(ButtonStyle.Success),
-                new ButtonBuilder().setCustomId(`leave_${tournamentId}`).setLabel('สละสิทธิ์').setStyle(ButtonStyle.Danger),
-                new ButtonBuilder().setCustomId(`start_${tournamentId}`).setLabel('ปิดรับสมัคร & เริ่มแข่ง').setStyle(ButtonStyle.Primary)
-            );
-
-            await message.channel.send({ embeds: [setupEmbed], components: [row] });
+            const v = await T.view(tournamentId);
+            if (v.tournament.status !== 'registration') {
+                return message.reply(`⚠️ งาน #${v.tournament.code} ไม่ได้อยู่ในช่วงรับสมัครแล้ว (ใช้ \`!current ${v.tournament.code}\` เพื่อดูคู่)`);
+            }
+            const sent = await message.channel.send({ embeds: [buildSetupEmbed(v)], components: [setupButtons(v.tournament.code)] });
+            await T.setDiscordRefs(v.tournament.id, { discord_channel_id: message.channel.id, setup_message_id: sent.id });
             setTimeout(() => message.delete().catch(() => {}), 1000);
-
         } catch (error) {
-            console.error('Setup Error:', error.message);
-            message.channel.send('ระบบเกิดข้อผิดพลาดในการสร้างบอร์ดรับสมัคร');
+            message.channel.send(`❌ ${errText(error)}`);
         }
     }
 
     if (command === '!current') {
-        if (!tournamentId) return message.reply('⚠️ ฟอร์แมตผิดครับ ใช้: `!current <id>`');
-
-        tournamentTimers.set(tournamentId, null);
-
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId(`timer_${tournamentId}`)
-                .setLabel('เริ่มจับเวลา 40 นาที')
-                .setStyle(ButtonStyle.Primary)
-                .setEmoji('⏱️'),
-            // 🎯 เพิ่มปุ่มใหม่: อัปเดตสายแข่งแมนนวล
-            new ButtonBuilder()
-                .setCustomId(`update_${tournamentId}`)
-                .setLabel('อัปเดตสายแข่ง (ขึ้นรอบใหม่)')
-                .setStyle(ButtonStyle.Success)
-                .setEmoji('🔄')
-        );
-
-        const embed = await getCurrentEmbed(tournamentId, null);
-        const sentMessage = await message.channel.send({ content: `อัปเดตสถานะการแข่งขันล่าสุด 📢`, embeds: [embed], components: [row] });
-
-        setTimeout(() => message.delete().catch(() => {}), 1000);
-
-        // 🎯 สังเกตว่าบล็อก setInterval (อัปเดตอัตโนมัติทุก 30 วิ) ถูกลบออกไปแล้วครับ!
-        // ภาพจะไม่ขยับเลยจนกว่าแอดมินจะกดยืนยันด้วยปุ่ม
+        if (!tournamentId) return message.reply('⚠️ ฟอร์แมตผิดครับ ใช้: `!current <เลขงาน>`');
+        try {
+            const t = await T.getTournament(tournamentId);
+            if (t.status === 'registration') return message.reply('⚠️ งานนี้ยังไม่เริ่มแข่งครับ');
+            await postCurrentBoard(message.channel, t.id);
+            setTimeout(() => message.delete().catch(() => {}), 1000);
+        } catch (error) {
+            message.channel.send(`❌ ${errText(error)}`);
+        }
     }
-   if (command === '!standing') {
-        if (!tournamentId) return message.reply('⚠️ ใส่ ID ทัวร์นาเมนต์ด้วยครับ');
+
+    if (command === '!standing') {
+        if (!tournamentId) return message.reply('⚠️ ใส่เลขงานด้วยครับ เช่น `!standing 12`');
 
         try {
-            const res = { data: await getTournamentFull(tournamentId) }; // ⚡ ผ่าน cache 5 วิ
-            
-            // 🎯 1. เช็กสถานะว่าทัวร์นาเมนต์จบหรือยัง
-            const tourneyState = res.data.tournament.state;
-            const isCompleted = (tourneyState === 'complete'); // ถ้าจบแล้วจะเป็น true
-            
-            let players = res.data.tournament.participants.map(p => p.participant);
-            let matches = res.data.tournament.matches ? res.data.tournament.matches.map(m => m.match) : [];
-            
-            const totalPlayers = players.length;
-            const rewardCount = totalPlayers >= 10 ? 5 : 3;
+            const v = await T.view(tournamentId);
+            const t = v.tournament;
+            if (!v.matches.length) return message.reply('⚠️ งานนี้ยังไม่เริ่มแข่งครับ');
 
-            // 🎯 2. ให้บอทนับ ชนะ/แพ้ และ "เช็กการปรับฟาวล์ (-1)" จากสกอร์
-            players.forEach(p => { p.calc_wins = 0; p.calc_losses = 0; p.is_forfeit = false; });
-            
-            matches.forEach(m => {
-                if (m.state === 'complete') {
-                    if (m.winner_id) {
-                        let winner = players.find(p => p.id === m.winner_id);
-                        let loser_id = (m.player1_id === m.winner_id) ? m.player2_id : m.player1_id;
-                        let loser = players.find(p => p.id === loser_id);
-                        if (winner) winner.calc_wins += 1;
-                        if (loser) loser.calc_losses += 1;
-                    }
-                    
-                    if (m.scores_csv) {
-                        let setScores = m.scores_csv.split(',');
-                        setScores.forEach(scoreStr => {
-                            let parts = scoreStr.match(/(-?\d+)-(-?\d+)/);
-                            if (parts) {
-                                let score1 = parseInt(parts[1]);
-                                let score2 = parseInt(parts[2]);
-                                
-                                if (score1 < 0) {
-                                    let p1 = players.find(p => p.id === m.player1_id);
-                                    if (p1) p1.is_forfeit = true;
-                                }
-                                if (score2 < 0) {
-                                    let p2 = players.find(p => p.id === m.player2_id);
-                                    if (p2) p2.is_forfeit = true;
-                                }
-                            }
-                        });
-                    }
-                }
-            });
-
-            // 🎯 3. จัดอันดับใหม่
-            players.sort((a, b) => {
-                const rankA = a.final_rank;
-                const rankB = b.final_rank;
-
-                if (rankA && rankB) {
-                    if (rankA !== rankB) return rankA - rankB; 
-                    if (a.is_forfeit !== b.is_forfeit) return a.is_forfeit ? 1 : -1;
-                    if (a.calc_wins !== b.calc_wins) return b.calc_wins - a.calc_wins;
-                    return a.calc_losses - b.calc_losses;
-                }
-                
-                if (!rankA && rankB) return -1;
-                if (rankA && !rankB) return 1;
-
-                if (b.calc_wins !== a.calc_wins) return b.calc_wins - a.calc_wins;
-                return a.calc_losses - b.calc_losses;
-            });
-
-            // 🎯 4. ลูปเพื่อแสดงผลรันตัวเลข และใส่ป้ายบอกสถานะ
-            let standingText = `ผู้เข้าร่วมทั้งหมด: **${totalPlayers}** คน (โควตาแจกแต้ม: **Top ${rewardCount}**)\n`;
-            
-            if (isCompleted) {
-                standingText += `**🏁 ทัวร์นาเมนต์นี้จบการแข่งขันแล้ว 🏁**\n\n`;
-            } else {
-                standingText += `\n`;
-            }
-
-            players.forEach((p, index) => {
-                const listIndex = index + 1; 
-                let displayRank = listIndex; // 🎯 รันตัวเลขตามอันดับจริง ไม่มีอันดับร่วมแล้ว
-
-                const wins = p.calc_wins !== undefined ? p.calc_wins : 0; 
-                const losses = p.calc_losses !== undefined ? p.calc_losses : 0; 
-                
-                const isRewarded = (displayRank <= rewardCount) ? "🎁 *(ได้ 5 แต้ม)*" : "";
-                const forfeitTag = p.is_forfeit ? " *(ถอนตัว)*" : "";
-                
-                if (listIndex === 1) {
-                    standingText += `🥇 **อันดับ 1 : ${p.name}** (ชนะ ${wins} แพ้ ${losses}) ${isRewarded}\n`;
-                } else if (listIndex === 2) {
-                    standingText += `🥈 **อันดับ 2 : ${p.name}** (ชนะ ${wins} แพ้ ${losses}) ${isRewarded}\n`;
-                } else if (listIndex === 3) {
-                    standingText += `🥉 **อันดับ 3 : ${p.name}** (ชนะ ${wins} แพ้ ${losses}) ${isRewarded}\n`;
-                } else {
-                    standingText += `🔹 อันดับ ${displayRank} : ${p.name}${forfeitTag} (ชนะ ${wins} แพ้ ${losses}) ${isRewarded}\n`;
-                }
-            });
-
-            // เปลี่ยนสีขอบและหัวข้อให้ชัดเจนถ้าจบแล้ว
-            const embedTitle = isCompleted ? `📊 สรุปตารางคะแนน (ปิดจ็อบแล้ว)` : `📊 สรุปตารางคะแนนล่าสุด`;
-            const embedColor = isCompleted ? 0x00FF00 : 0xFFD700; // สีเขียวถ้าจบแล้ว สีทองถ้ากำลังแข่ง
-
-            const embed = new EmbedBuilder()
-                .setTitle(embedTitle)
-                .setDescription(standingText)
-                .setColor(embedColor);
-
-            // 🎯 5. ส่งผลลัพธ์ (แยกเงื่อนไขมีปุ่ม กับไม่มีปุ่ม)
-            if (!isCompleted) {
-                // ถ้ายังไม่จบ ให้แสดงปุ่มตามปกติ
+            const embed = buildStandingEmbed(v);
+            if (t.status === 'running') {
                 const row = new ActionRowBuilder().addComponents(
                     new ButtonBuilder()
-                        .setCustomId(`reward_${tournamentId}_${rewardCount}`)
-                        .setLabel(`แจก 5 แต้มให้ Top ${rewardCount}`)
-                        .setStyle(ButtonStyle.Success)
-                        .setEmoji('💸'),
+                        .setCustomId(`reward_${t.code}`)
+                        .setLabel(t.points_awarded_at ? 'แจกแต้มไปแล้ว' : `แจกแต้มให้ Top ${v.pointsQuota}`)
+                        .setStyle(ButtonStyle.Success).setEmoji('💸')
+                        .setDisabled(!!t.points_awarded_at),
                     new ButtonBuilder()
-                        .setCustomId(`finish_${tournamentId}`)
-                        .setLabel(`ปิดจ็อบ & บันทึกประวัติ`)
-                        .setStyle(ButtonStyle.Danger)
-                        .setEmoji('🏁')
+                        .setCustomId(`finish_${t.code}`)
+                        .setLabel('ปิดจ็อบ & บันทึกประวัติ')
+                        .setStyle(ButtonStyle.Danger).setEmoji('🏁')
                 );
                 await message.channel.send({ embeds: [embed], components: [row] });
             } else {
-                // ถ้าจบแล้ว ไม่ต้องส่ง ActionRow (ซ่อนปุ่มไปเลย)
                 await message.channel.send({ embeds: [embed] });
             }
-
             setTimeout(() => message.delete().catch(() => {}), 1000);
-
         } catch (error) {
-            const status = error.response?.status;
-
-            if (status === 429) {
-                const retrySec = parseRetryAfterSec(error.response.headers?.['retry-after']);
-                const waitText = retrySec ? `${retrySec} วินาที` : 'ประมาณ 1 นาที';
-                console.warn(`⏳ [!standing] Challonge 429 Too Many Requests | tournament=${tournamentId} | retry-after=${retrySec ?? 'n/a'}s${error.fromLocalCooldown ? ' | (บล็อกจาก cooldown ในบอท ไม่ได้ยิง API)' : ''}`);
-                await message.channel.send(
-                    `⏳ **Challonge จำกัดจำนวนการเรียก API ชั่วคราว (HTTP 429 Too Many Requests)**\n` +
-                    `บอทดึงตารางคะแนนของ \`${tournamentId}\` ไม่ได้ในตอนนี้ — กรุณารอ **${waitText}** แล้วพิมพ์ \`!standing ${tournamentId}\` ใหม่ครับ\n` +
-                    `-# ระหว่างนี้บอทจะพักการเรียก Challonge อัตโนมัติ ไม่ต้องกดซ้ำ`
-                ).catch(() => {});
-                return;
-            }
-
-            let reason = 'ไม่สามารถดึงข้อมูลตารางคะแนนได้';
-            if (status === 404) reason = `ไม่พบทัวร์นาเมนต์ ID \`${tournamentId}\` (เช็ก ID อีกครั้ง)`;
-            else if (status === 401 || status === 403) reason = 'Challonge ปฏิเสธคีย์ (401/403) — ตรวจ CHALLONGE_API_KEY ใน .env';
-            else if (status >= 500) reason = `เซิร์ฟเวอร์ Challonge มีปัญหา (HTTP ${status}) ลองใหม่อีกสักครู่`;
-            else if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') reason = 'Challonge ตอบช้าเกิน 8 วินาที ลองใหม่อีกครั้ง';
-
-            console.error(`❌ [!standing] tournament=${tournamentId} | ${status ? 'HTTP ' + status : (error.code || 'no-response')} | ${error.message}`);
-            await message.channel.send(`❌ ${reason}`).catch(() => {});
+            await message.channel.send(`❌ ${errText(error)}`).catch(() => {});
         }
     }
+
 
 // ---------------------------------------------------------
     // 📜 คำสั่งใหม่: !dmtprof (โชว์โปรไฟล์ไดโนมาสเตอร์สุดเท่)
@@ -806,63 +607,43 @@ client.on('messageCreate', async message => {
 
     if (command === '!pollchamp') {
         if (!message.member.permissions.has('ManageMessages')) return message.reply('⛔ คุณไม่มีสิทธิ์สร้างโพลล์ครับ');
-        
-        // 🎯 [แก้จุดนี้] ดึงเฉพาะไอดีที่ต่อท้ายคำสั่ง
-        const pollTourneyId = message.content.split(' ')[1]; 
-        
-        if (!pollTourneyId) return message.reply('⚠️ ฟอร์แมตผิดครับ ใช้: `!pollchamp <id_challonge>`');
+
+        const pollTourneyId = message.content.split(' ')[1];
+        if (!pollTourneyId) return message.reply('⚠️ ฟอร์แมตผิดครับ ใช้: `!pollchamp <เลขงาน>`');
 
         try {
-            // ดึงรายชื่อจาก Challonge ทันที
-            const res = await axios.get(`https://api.challonge.com/v1/tournaments/${pollTourneyId}/participants.json`, {
-                params: { api_key: CHALLONGE_API_KEY }
-            });
-            let participants = res.data.map(p => p.participant.name);
+            const full = await T.getFull(pollTourneyId);
+            const code = String(full.tournament.code);
+            let participants = full.players.filter(p => !p.dropped_at).map(p => p.display_name);
 
             if (participants.length === 0) return message.reply('❌ ไม่พบผู้เข้าแข่งขันในทัวร์นาเมนต์นี้');
 
             // ⚠️ Discord รองรับ Dropdown สูงสุด 25 ตัวเลือก ถ้าเกินให้ตัดมาแค่ 25 คนแรก
             if (participants.length > 25) participants = participants.slice(0, 25);
 
-            // สร้างเมนู Dropdown
             const selectMenu = new StringSelectMenuBuilder()
-                .setCustomId(`pollselect_${pollTourneyId}`)
+                .setCustomId(`pollselect_${code}`)
                 .setPlaceholder('🔽 คลิกเพื่อเลือกตัวเต็งแชมป์ของคุณ!')
-                .addOptions(
-                    participants.map((name, index) => 
-                        new StringSelectMenuOptionBuilder()
-                            .setLabel(name.substring(0, 100))
-                            .setValue(`player_${index}`)
-                    )
-                );
+                .addOptions(participants.map((name, index) =>
+                    new StringSelectMenuOptionBuilder().setLabel(name.substring(0, 100)).setValue(`player_${index}`)));
 
-            // สร้างปุ่มปิดโพลล์
             const closeBtn = new ButtonBuilder()
-                .setCustomId(`pollclose_${pollTourneyId}`)
+                .setCustomId(`pollclose_${code}`)
                 .setLabel('ปิดโพลล์ & สรุปผล')
                 .setStyle(ButtonStyle.Danger)
                 .setEmoji('🛑');
 
-            const row1 = new ActionRowBuilder().addComponents(selectMenu);
-            const row2 = new ActionRowBuilder().addComponents(closeBtn);
-
             const pollMsg = await message.channel.send({
                 content: `🏆 **โหวตทายผลแชมป์ทัวร์นาเมนต์!**\nเฉพาะนักแข่งและแอดมินเท่านั้นที่มีสิทธิ์โหวต (1 คนโหวตได้ 1 ครั้ง หากกดใหม่จะเปลี่ยนผลโหวตให้เลยครับ)`,
-                components: [row1, row2]
+                components: [new ActionRowBuilder().addComponents(selectMenu), new ActionRowBuilder().addComponents(closeBtn)]
             });
 
-            // บันทึกสถานะลงในระบบ
-            activePolls.set(pollTourneyId, {
-                messageId: pollMsg.id,
-                participants: participants,
-                votes: {} // กล่องเก็บว่า ใครโหวตเบอร์ไหน { discordId: playerIndex }
-            });
-
+            activePolls.set(code, { messageId: pollMsg.id, participants, votes: {} });
         } catch (error) {
-            console.error('Poll Error:', error);
-            message.reply('❌ ไม่สามารถดึงข้อมูลได้ครับ ตรวจสอบ ID อีกครั้ง');
+            message.reply(`❌ ${errText(error)}`);
         }
     }
+
 
     // ---------------------------------------------------------
     // 🏆 คำสั่งใหม่: !dmtrank (สร้างกระดานจัดอันดับแบบ Real-time)
@@ -931,7 +712,7 @@ client.on('interactionCreate', async interaction => {
                 }
 
                 // อัปเดตเฉพาะคนในชุดนี้: เอาออกทั้งชุดก่อน แล้วใส่กลับเฉพาะคนที่ถูกติ๊ก
-                state.chunks[chunkIndex].forEach(p => state.full.delete(p.discordId));
+                state.chunks[chunkIndex].forEach(p => state.full.delete(p.id));
                 interaction.values.forEach(id => state.full.add(id));
 
                 return await interaction.update({
@@ -944,7 +725,6 @@ client.on('interactionCreate', async interaction => {
 
             const tourneyId = interaction.customId.split('_')[1];
 
-            const COMPETITOR_ROLE_ID = '1476156740738486457';
             const isAdmin = interaction.member.permissions.has('ManageMessages');
             const isCompetitor = interaction.member.roles.cache.has(COMPETITOR_ROLE_ID);
 
@@ -990,8 +770,6 @@ client.on('interactionCreate', async interaction => {
             return await interaction.editReply('❌ ปุ่มไม่ถูกต้อง');
         }
 
-        const nickname = interaction.member.nickname || interaction.user.displayName;
-        const apiUrl = `https://api.challonge.com/v1/tournaments/${tournamentId}/participants.json`;
 
         // =========================
         // 🔴 POLL CLOSE
@@ -1035,64 +813,31 @@ client.on('interactionCreate', async interaction => {
 
             return await interaction.editReply('✅ ปิดโพลล์แล้ว');
         }
-
         // =========================
-        // 🔄 UPDATE
+        // 🔄 UPDATE (บอร์ดคู่ปัจจุบัน)
         // =========================
         if (action === 'update') {
-            const endTime = tournamentTimers.get(tournamentId) || null;
-
-            const updatedEmbed = await getCurrentEmbed(tournamentId, endTime);
-            await interaction.message.edit({ embeds: [updatedEmbed] });
-
+            const v = await T.view(tournamentId);
+            await interaction.message.edit({ embeds: [buildCurrentEmbed(v)], components: v.tournament.status === 'running' ? [currentButtons(v)] : [] });
             return await interaction.editReply('✅ อัปเดตแล้ว');
         }
 
-// =========================
+        // =========================
         // 🟢 REGISTER (สมัครแข่ง)
         // =========================
         if (action === 'register') {
-            const GAS_WEB_APP_URL = process.env.BOT_BRIDGE_URL;
-
+            const serverNickname = interaction.member.nickname || interaction.user.displayName;
             try {
-                // เช็คก่อนว่าลงทะเบียนในระบบเว็บแอปหรือยัง
-                const gasRes = await axios.post(GAS_WEB_APP_URL, {
-                    action: 'get_profile',
-                    discordId: interaction.user.id
-                }, { timeout: 8000, headers: { 'x-bot-secret': process.env.BOT_BRIDGE_SECRET } });
-
-                const userProfile = gasRes.data;
-
-                if (!userProfile.found) {
-                    return await interaction.editReply('❌ คุณยังไม่ได้ลงทะเบียนในระบบฐานข้อมูลครับ');
-                }
-
-                // 🎯 ดึงชื่อเล่นในเซิร์ฟเวอร์ ณ วินาทีที่กด (ถ้าไม่ได้ตั้งชื่อเล่นไว้ ให้ใช้ชื่อ Discord ปกติ)
-                const serverNickname = interaction.member.nickname || interaction.user.displayName;
-                
-                // ⚠️ สำคัญ: ห้อยแท็ก <@ID> ไว้ด้านหลัง เพื่อให้ปุ่มแจกแต้มและบันทึกสถิติหาตัวเจอ
-                const challongeName = `${serverNickname} <@${interaction.user.id}>`;
-
-                // เพิ่มผู้เข้าแข่งลง Challonge
-                await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/participants.json`, {
-                    participant: { name: challongeName }
-                }, {
-                    params: { api_key: CHALLONGE_API_KEY },
-                    timeout: 8000
+                await T.addPlayer(tournamentId, {
+                    discord_id: interaction.user.id,
+                    display_name: serverNickname,
+                    requireAccount: true, // ต้องมีบัญชีในฐานข้อมูล (เว็บ DMT Shop หรือบัญชีเก่า) ถึงจะสมัครได้
                 });
-
-                // 🎯 อัปเดตหน้าบอร์ดรับสมัครเพื่อให้ตัวเลข "จำนวนคน" เปลี่ยนทันที
-                const updatedEmbed = await getSetupEmbed(tournamentId);
-                if (updatedEmbed) {
-                    await interaction.message.edit({ embeds: [updatedEmbed] });
-                }
-
                 return await interaction.editReply(`✅ สมัครแข่งสำเร็จในชื่อ **${serverNickname}**!`);
             } catch (error) {
-                if (error.response?.status === 422) {
-                    return await interaction.editReply('⚠️ คุณได้สมัครไปแล้ว หรือ ID ทัวร์นาเมนต์ไม่ถูกต้อง');
-                }
-                throw error;
+                if (error.message === 'NO_ACCOUNT') return await interaction.editReply('❌ คุณยังไม่ได้ลงทะเบียนในระบบฐานข้อมูลครับ (สมัคร/ผูก Discord ที่เว็บ DMT Shop ก่อน)');
+                if (/ข้อมูลซ้ำ/.test(error.message)) return await interaction.editReply('⚠️ คุณสมัครงานนี้ไปแล้วครับ');
+                return await interaction.editReply(`❌ ${errText(error)}`);
             }
         }
 
@@ -1101,76 +846,26 @@ client.on('interactionCreate', async interaction => {
         // =========================
         if (action === 'leave') {
             try {
-                const getRes = await axios.get(apiUrl, {
-                    params: { api_key: CHALLONGE_API_KEY }
-                });
-
-                const participants = getRes.data.map(p => p.participant);
-                
-                // 🎯 ค้นหาจาก <@DiscordID> เพื่อความแม่นยำ 100% ไม่ว่าชื่อเล่นจะเปลี่ยนไปแค่ไหน
-                const userParticipant = participants.find(p => p.name.includes(`<@${interaction.user.id}>`));
-
-                if (!userParticipant) {
-                    return await interaction.editReply('❌ ไม่พบการสมัครของคุณในการแข่งขันนี้ครับ');
-                }
-
-                // สั่งลบชื่อจาก Challonge
-                await axios.delete(`https://api.challonge.com/v1/tournaments/${tournamentId}/participants/${userParticipant.id}.json`, {
-                    params: { api_key: CHALLONGE_API_KEY }
-                });
-
-                // 🎯 อัปเดตหน้าบอร์ดรับสมัครเพื่อให้ตัวเลข "จำนวนคน" ลดลงทันที
-                const updatedEmbed = await getSetupEmbed(tournamentId);
-                if (updatedEmbed) {
-                    await interaction.message.edit({ embeds: [updatedEmbed] });
-                }
-
+                await T.removePlayerByDiscord(tournamentId, interaction.user.id);
                 return await interaction.editReply('✅ สละสิทธิ์เรียบร้อยแล้ว');
             } catch (error) {
-                throw error;
+                return await interaction.editReply(`❌ ${errText(error)}`);
             }
         }
 
-
         // =========================
-        // 🟢 START
+        // 🟣 START (ปิดรับสมัคร → สุ่ม seed → จับคู่รอบแรก)
         // =========================
         if (action === 'start') {
             if (!interaction.member.permissions.has('ManageMessages')) {
                 return await interaction.editReply('⛔ เฉพาะแอดมิน');
             }
-
             try {
-                // 🔀 1) สุ่ม seed ผู้เล่นใหม่ (Shuffle Seeds) ก่อนเริ่ม — Challonge ทำได้เฉพาะตอนยังไม่เริ่มแข่ง
-                try {
-                    await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/participants/randomize.json`, {}, {
-                        params: { api_key: CHALLONGE_API_KEY }
-                    });
-                } catch (shuffleError) {
-                    const errs = [].concat(shuffleError.response?.data?.errors || []).join(' ');
-                    if (/already.*(started|underway)|in progress|underway/i.test(errs)) {
-                        return await interaction.editReply('⚠️ ทัวร์นาเมนต์นี้เริ่มแล้ว (สุ่ม seed ไม่ได้)');
-                    }
-                    const status = shuffleError.response?.status;
-                    console.error(`❌ [start] Shuffle seeds ล้มเหลว | tournament=${tournamentId} | ${status ? 'HTTP ' + status : (shuffleError.code || 'no-response')} | ${errs || shuffleError.message}`);
-                    const why = status === 429
-                        ? 'Challonge จำกัดจำนวนการเรียก API ชั่วคราว (429) รอสักครู่แล้วกดใหม่'
-                        : (errs || shuffleError.message);
-                    return await interaction.editReply(`❌ สุ่ม seed ไม่สำเร็จ จึง**ยังไม่เริ่มแข่ง**\n> ${why}`);
-                }
-
-                // 🟢 2) เริ่มแข่ง
-                await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/start.json`, {}, {
-                    params: { api_key: CHALLONGE_API_KEY }
-                });
-                tourneyCache.delete(String(tournamentId).trim().toLowerCase()); // ล้าง cache ให้ !standing เห็นสายใหม่ทันที
-
-                return await interaction.editReply('🔀 สุ่ม seed เรียบร้อย\n✅ เริ่มแข่งขันแล้ว!');
+                const v = await T.startTournament(tournamentId);
+                // บอร์ดรับสมัคร + โพสต์คู่รอบแรก จะอัปเดตเองผ่าน event 'round'
+                return await interaction.editReply(`🔀 สุ่ม seed เรียบร้อย\n✅ เริ่มแข่งขันแล้ว! (${v.players.length} คน)`);
             } catch (error) {
-                if (error.response?.data?.errors?.includes('Tournament has already been started')) {
-                    return await interaction.editReply('⚠️ ทัวร์นาเมนต์นี้เริ่มแล้ว');
-                }
-                throw error;
+                return await interaction.editReply(`❌ ${errText(error)}`);
             }
         }
 
@@ -1181,325 +876,113 @@ client.on('interactionCreate', async interaction => {
             if (!interaction.member.permissions.has('ManageMessages')) {
                 return await interaction.editReply('⛔ เฉพาะแอดมิน');
             }
-
-            const durationMs = 40 * 60 * 1000; // 40 นาที
-            const endTime = Date.now() + durationMs;
-
-            tournamentTimers.set(tournamentId, endTime);
-
-            const updatedEmbed = await getCurrentEmbed(tournamentId, endTime);
-            await interaction.message.edit({ embeds: [updatedEmbed] });
-
-            return await interaction.editReply('✅ เริ่มจับเวลา 40 นาทีแล้ว!');
+            try {
+                const t = await T.startTimer(tournamentId);
+                return await interaction.editReply(`✅ เริ่มจับเวลา ${t.round_minutes} นาทีแล้ว!`);
+            } catch (error) {
+                return await interaction.editReply(`❌ ${errText(error)}`);
+            }
         }
 
-  // =========================
+        // =========================
         // 💸 REWARD (ปุ่มแจกแต้ม)
         // =========================
         if (action === 'reward') {
             if (!interaction.member.permissions.has('ManageMessages')) return await interaction.editReply('⛔ เฉพาะแอดมิน');
-
-            const rewardCount = parseInt(parts[2]) || 3;
-            const GAS_WEB_APP_URL = process.env.BOT_BRIDGE_URL;
-
             try {
-                // 1. ดึงข้อมูลผู้เข้าแข่งและแมตช์ทั้งหมดมาคำนวณเอง
-                const res = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}.json`, {
-                    params: { api_key: CHALLONGE_API_KEY, include_participants: 1, include_matches: 1 }
-                });
-
-                const tournamentName = res.data.tournament.name;
-                let players = res.data.tournament.participants.map(p => p.participant);
-                let matches = res.data.tournament.matches ? res.data.tournament.matches.map(m => m.match) : [];
-
-                // 2. คำนวณ ชนะ/แพ้ แบบเจาะลึก
-                players.forEach(p => { p.calc_wins = 0; p.calc_losses = 0; p.is_forfeit = false; });
-                matches.forEach(m => {
-                    if (m.state === 'complete') {
-                        if (m.winner_id) {
-                            let winner = players.find(p => p.id === m.winner_id);
-                            let loser_id = (m.player1_id === m.winner_id) ? m.player2_id : m.player1_id;
-                            let loser = players.find(p => p.id === loser_id);
-                            if (winner) winner.calc_wins += 1;
-                            if (loser) loser.calc_losses += 1;
-                        }
-                        // เช็คสละสิทธิ์หรือโดนปรับฟาวล์จากสกอร์ติดลบ
-                        if (m.scores_csv) {
-                            let setScores = m.scores_csv.split(',');
-                            setScores.forEach(scoreStr => {
-                                let pts = scoreStr.match(/(-?\d+)-(-?\d+)/);
-                                if (pts) {
-                                    if (parseInt(pts[1]) < 0) { let p1 = players.find(p => p.id === m.player1_id); if (p1) p1.is_forfeit = true; }
-                                    if (parseInt(pts[2]) < 0) { let p2 = players.find(p => p.id === m.player2_id); if (p2) p2.is_forfeit = true; }
-                                }
-                            });
-                        }
-                    }
-                });
-
-                // 3. จัดเรียงอันดับตามความเก่งเป๊ะๆ
-                players.sort((a, b) => {
-                    const rankA = a.final_rank; const rankB = b.final_rank;
-                    if (rankA && rankB) {
-                        if (rankA !== rankB) return rankA - rankB;
-                        if (a.is_forfeit !== b.is_forfeit) return a.is_forfeit ? 1 : -1;
-                        if (a.calc_wins !== b.calc_wins) return b.calc_wins - a.calc_wins;
-                        return a.calc_losses - b.calc_losses;
-                    }
-                    if (!rankA && rankB) return -1;
-                    if (rankA && !rankB) return 1;
-                    if (b.calc_wins !== a.calc_wins) return b.calc_wins - a.calc_wins;
-                    return a.calc_losses - b.calc_losses;
-                });
-
-                // 4. เลือกผู้ชนะเพื่อส่งไปแจกแต้ม
-                let winners = [];
-                let currentDisplayRank = 1;
-
-                for (let i = 0; i < players.length; i++) {
-                    let listIndex = i + 1;
-                    currentDisplayRank = listIndex; // 🎯 รันตามอันดับจริง 1, 2, 3, 4... ให้ตรงกับป้ายประกาศผล
-
-                    // ถ้าอันดับเกินโควต้าที่ตั้งไว้ ให้หยุดทำงานทันที (แจกแค่ 3 หรือ 5 คน)
-                    if (currentDisplayRank > rewardCount) break;
-
-                    const player = players[i];
-                    const match = player.name.match(/<@(\d+)>/);
-                    if (match) {
-                        // แชมป์ (อันดับ 1) ได้ 10 แต้ม ที่เหลือได้ 5 แต้มเท่าเดิม
-                        const points = currentDisplayRank === 1 ? 10 : 5;
-                        winners.push({ discordId: match[1], points, name: tournamentName });
-                    }
-                }
-
-                if (winners.length > 0) {
-                    await axios.post(GAS_WEB_APP_URL, { action: 'award_points', winners: winners }, { headers: { 'x-bot-secret': process.env.BOT_BRIDGE_SECRET } });
-                }
-
-                return await interaction.editReply(`✅ แจกแต้มให้ Top ${rewardCount} เรียบร้อย! (แชมป์ 10 แต้ม, อันดับอื่น 5 แต้ม — รวมผู้ได้รับ ${winners.length} คน)`);
+                const res = await T.awardPoints(tournamentId);
+                let text = `✅ แจกแต้มให้ Top ${res.quota} เรียบร้อย! (แชมป์ 10 แต้ม, อันดับอื่น 5 แต้ม — รวมผู้ได้รับ ${res.awarded.length} คน)`;
+                if (res.skipped.length) text += `\n⚠️ ข้าม (ไม่มีบัญชี): ${res.skipped.map(s => s.name).join(', ')}`;
+                return await interaction.editReply(text);
             } catch (error) {
-                console.error("Reward Error:", error);
-                return await interaction.editReply('❌ เกิดข้อผิดพลาดในการแจกแต้ม');
+                return await interaction.editReply(`❌ ${errText(error)}`);
             }
         }
 
-      // ==========================================
+        // ==========================================
         // 🏁 FINISH (ปุ่มปิดจ็อบ & บันทึกสถิติ)
         // ==========================================
-        // ขั้นที่ 1: กดปุ่ม "ปิดจ็อบ" → ยังไม่แจก EXP แต่ขึ้นรายการให้แอดมินติ๊กก่อน
+        // ขั้นที่ 1: ขึ้นรายการให้แอดมินติ๊กคนที่เล่นครบทุกรอบก่อน
         if (action === 'finish') {
             if (!interaction.member.permissions.has('ManageMessages')) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
 
             try {
-                const res = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}.json`, {
-                    params: { api_key: CHALLONGE_API_KEY, include_participants: 1, include_matches: 1 }
-                });
-
-                const tournamentName = res.data.tournament.name;
-                const participants = res.data.tournament.participants.map(p => p.participant);
-                const matches = res.data.tournament.matches ? res.data.tournament.matches.map(m => m.match) : [];
-                const playedCount = countMatchesPlayed(matches);
-
-                const players = [];
-                const noShow = [];
-
-                await interaction.guild.members.fetch().catch(() => {});
-
-                participants.forEach(p => {
-                    const idMatch = p.name.match(/<@(\d+)>/);
-                    if (!idMatch) return; // ไม่มี Discord ผูกไว้ ข้ามไป
-                    const discordId = idMatch[1];
-                    const member = interaction.guild.members.cache.get(discordId);
-                    const entry = {
-                        discordId,
-                        challongeId: p.id,
-                        label: p.name.replace(/<@\d+>/, '').trim()
-                            || member?.displayName
-                            || `ผู้เล่น ${p.id}`
-                    };
-                    if ((playedCount[p.id] || 0) > 0) players.push(entry);
-                    else noShow.push(entry.label);
-                });
-
-                if (players.length === 0) {
-                    return await interaction.editReply('⚠️ ไม่พบผู้เล่นที่ลงแข่งจริงและผูก Discord ไว้ ตรวจสอบชื่อผู้เข้าแข่งใน Challonge ครับ');
+                const v = await T.view(tournamentId);
+                if (v.tournament.status === 'finished') return await interaction.editReply('⚠️ งานนี้ปิดจ็อบไปแล้ว');
+                if (!v.canFinish) {
+                    return await interaction.editReply(v.allMatchesComplete
+                        ? `⚠️ ยังแข่งไม่ครบ ${v.totalRounds} รอบ (ตอนนี้รอบ ${v.currentRound}) — จับคู่รอบถัดไปที่เว็บก่อน`
+                        : '⚠️ ยังมีแมตช์ที่ยังไม่กรอกผล กรอกให้ครบที่เว็บจัดทัวร์ก่อนครับ');
                 }
+
+                const players = v.standings.filter(s => s.played > 0).map(s => ({
+                    id: s.player_id, rank: s.rank, linked: s.linked,
+                    label: `${s.rank}. ${s.name}`,
+                    mention: s.discord_id ? `<@${s.discord_id}>` : `**${s.name}**`,
+                }));
+                const noShow = v.standings.filter(s => s.played === 0).map(s => (s.discord_id ? `<@${s.discord_id}>` : s.name));
+                if (players.length === 0) return await interaction.editReply('⚠️ ไม่พบผู้เล่นที่ลงแข่งจริง');
 
                 // แบ่งเป็นชุดละ 25 คน (ข้อจำกัดของ Discord select menu) สูงสุด 4 ชุด = 100 คน
                 const chunks = [];
-                for (let i = 0; i < players.length && chunks.length < 4; i += 25) {
-                    chunks.push(players.slice(i, i + 25));
-                }
+                for (let i = 0; i < players.length && chunks.length < 4; i += 25) chunks.push(players.slice(i, i + 25));
 
                 const state = {
-                    tournamentName,
-                    players,
-                    noShow,
-                    chunks,
-                    full: new Set(players.map(p => p.discordId)) // ค่าเริ่มต้น: ติ๊กทุกคนไว้ก่อน
+                    tournamentName: v.tournament.name,
+                    players, noShow, chunks,
+                    full: new Set(v.standings.filter(s => s.played > 0 && !s.dropped).map(s => s.player_id)),
                 };
-                pendingFinish.set(tournamentId, state);
+                pendingFinish.set(String(v.tournament.code), state);
 
                 return await interaction.editReply({
                     content: buildFullPlayText(state),
-                    components: buildFullPlayComponents(tournamentId, state)
+                    components: buildFullPlayComponents(v.tournament.code, state)
                 });
-
             } catch (error) {
-                console.error("Finish Checklist Error:", error.response?.data || error.message);
-                return await interaction.editReply('❌ ดึงข้อมูลผู้เข้าแข่งไม่สำเร็จ กรุณาตรวจสอบ Log');
+                return await interaction.editReply(`❌ ${errText(error)}`);
             }
         }
 
-        // ขั้นที่ 2: ยืนยันแล้ว → finalize + แจก EXP จริง
         if (action === 'fullcancel') {
-            pendingFinish.delete(tournamentId);
+            pendingFinish.delete(String(tournamentId));
             return await interaction.editReply('✖️ ยกเลิกการปิดจ็อบแล้ว ยังไม่มีการแจก EXP ครับ');
         }
 
+        // ขั้นที่ 2: ยืนยันแล้ว → ปิดจ็อบ + แจก EXP (ธุรกรรมเดียวใน Supabase)
         if (action === 'fullall' || action === 'fullconfirm') {
-            const COMPETITOR_ROLE_ID = '1476156740738486457';
-
             if (!interaction.member.permissions.has('ManageMessages')) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
 
-            const state = pendingFinish.get(tournamentId);
+            const state = pendingFinish.get(String(tournamentId));
             if (!state) return await interaction.editReply('❌ รายการนี้หมดอายุแล้ว กดปุ่ม "ปิดจ็อบ" ใหม่อีกครั้งครับ');
 
-            // ปุ่ม "ทุกคนเล่นครบ" = ติ๊กให้ทุกคนอัตโนมัติ
-            const fullPlayedIds = (action === 'fullall')
-                ? new Set(state.players.map(p => p.discordId))
-                : state.full;
+            const playedAllIds = action === 'fullall' ? state.players.map(p => p.id) : [...state.full];
 
             try {
-                // 🎯 1. สั่ง Finalize ใน Challonge เป็นอย่างแรก!
-                // เพื่อให้ระบบคำนวณ final_rank ให้ครบทุกคนก่อนจะดึงข้อมูลไปแจก EXP
-                await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/finalize.json`, {}, {
-                    params: { api_key: CHALLONGE_API_KEY }
-                });
+                const out = await T.finish(tournamentId, { playedAllIds });
+                pendingFinish.delete(String(tournamentId));
 
-                // 2. ดึงข้อมูลที่อัปเดต final_rank เสร็จสมบูรณ์แล้ว
-                const tourneyRes = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}.json`, {
-                    params: { api_key: CHALLONGE_API_KEY, include_participants: 1, include_matches: 1 }
-                });
-
-                const tournamentName = tourneyRes.data.tournament.name;
-                const matches = tourneyRes.data.tournament.matches.map(m => m.match);
-                let players = tourneyRes.data.tournament.participants.map(p => p.participant);
-
-                // 3. นำรายชื่อมาจัดเรียงตาม final_rank ที่ Challonge สรุปให้
-                players.sort((a, b) => (a.final_rank || 999) - (b.final_rank || 999));
-
-                let participantsList = "";
-                let awards = [];
-                let skippedNoShow = [];
-                const participantMap = {};
-                const playedCount = countMatchesPlayed(matches);
-
-                // 4. วนลูปคำนวณ EXP รายคน (อันดับ + เข้าร่วม + โบนัสเล่นครบทุกรอบ)
-                players.forEach((participant, index) => {
-                    const name = participant.name;
-                    // ถึงตรงนี้รับรองว่ามี final_rank แน่นอน 100%
-                    const rank = participant.final_rank || (index + 1);
-                    const discordIdMatch = name.match(/<@(\d+)>/);
-                    const discordId = discordIdMatch ? discordIdMatch[1] : null;
-
-                    participantMap[participant.id] = name;
-                    participantsList += `${rank}. ${name}\n`;
-
-                    if (!discordId) return;
-
-                    // สมัครแต่ไม่ได้ลงแข่งเลย = ไม่ได้ EXP
-                    if ((playedCount[participant.id] || 0) === 0) {
-                        skippedNoShow.push(discordId);
-                        return;
-                    }
-
-                    const playedAll = fullPlayedIds.has(discordId);
-                    awards.push({
-                        discordId,
-                        rank,
-                        exp: calcTournamentExp(rank, playedAll),
-                        playedAll
-                    });
-                });
-
-                // 5. สรุปแมตช์ที่แข่งมาทั้งหมด
-                let matchHistory = "";
-                matches.forEach(match => {
-                    const p1 = participantMap[match.player1_id] || "Unknown";
-                    const p2 = participantMap[match.player2_id] || "Unknown";
-                    const winner = participantMap[match.winner_id] || "เสมอ/ไม่มีผู้ชนะ";
-                    const score = match.scores_csv || "0-0";
-                    matchHistory += `รอบ ${match.round}: ${p1} vs ${p2} | ชนะ: ${winner} (${score})\n`;
-                });
-
-                // 6. บันทึกลง Supabase (แจก EXP + ลงประวัติ + อัปสถิติ) ในทีเดียว
-                if (!checkSupabaseEnv('Finish')) {
-                    return await interaction.editReply('❌ ยังไม่ได้ตั้งค่า SUPABASE_SERVICE_KEY (service_role key) ใน .env — ยังแจก EXP ไม่ได้');
-                }
-
-                const rpcRes = await axios.post(`${SUPABASE_URL}/rest/v1/rpc/bot_finish_tournament`, {
-                    p_tournament_name: tournamentName,
-                    p_participants_list: participantsList.trim(),
-                    p_match_history: matchHistory.trim(),
-                    p_player_count: players.length,
-                    p_awards: awards
-                }, {
-                    headers: {
-                        apikey: SUPABASE_SERVICE_KEY,
-                        Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
-                        'Content-Type': 'application/json'
-                    }
-                });
-
-                const awardedCount = rpcRes.data?.awarded ?? 0;
-                const notFound = rpcRes.data?.skipped || [];
-
-                // 7. เคลียร์ยศนักแข่ง
-                const role = interaction.guild.roles.cache.get(COMPETITOR_ROLE_ID);
-                if (role) {
-                    await interaction.guild.members.fetch();
-                    for (const [id, member] of role.members) {
-                        await member.roles.remove(COMPETITOR_ROLE_ID).catch(() => {});
-                    }
-                }
-
-                pendingFinish.delete(tournamentId);
-
-                // 8. สรุปผลให้แอดมินดูว่าใครได้เท่าไหร่ เพราะอะไร
-                let summary = `✅ ปิดงานแข่ง **"${tournamentName}"** เรียบร้อย!\n📊 แจก EXP ให้ผู้เล่น ${awardedCount} คน\n\n`;
-                awards
-                    .sort((a, b) => a.rank - b.rank)
+                let summary = `✅ ปิดงานแข่ง **"${state.tournamentName}"** เรียบร้อย!\n📊 แจก EXP ให้ผู้เล่น ${out.awarded.length} คน\n\n`;
+                out.results
+                    .filter(r => r.played > 0)
                     .slice(0, 25)
-                    .forEach(a => {
-                        const place = getPlacementExp(a.rank);
+                    .forEach(r => {
+                        const place = getPlacementExp(r.rank);
                         const detail = [`เข้าร่วม +${EXP_JOIN}`];
-                        if (place > 0) detail.unshift(`อันดับ ${a.rank} +${place}`);
-                        if (a.playedAll) detail.push(`เล่นครบทุกรอบ +${EXP_FULL_PLAY}`);
-                        summary += `${a.playedAll ? '☑️' : '⬜'} <@${a.discordId}> → **${a.exp} EXP** (${detail.join(', ')})\n`;
+                        if (place > 0) detail.unshift(`อันดับ ${r.rank} +${place}`);
+                        if (r.playedAll) detail.push(`เล่นครบทุกรอบ +${EXP_FULL_PLAY}`);
+                        const who = r.discord_id ? `<@${r.discord_id}>` : `**${r.name}**`;
+                        summary += `${r.playedAll ? '☑️' : '⬜'} ${who} → **${r.exp} EXP** (${detail.join(', ')})\n`;
                     });
-
-                if (skippedNoShow.length > 0) {
-                    summary += `\n🚫 ไม่ได้ลงแข่งเลย ไม่ได้ EXP: ${skippedNoShow.map(id => `<@${id}>`).join(', ')}`;
-                }
-                if (notFound.length > 0) {
-                    summary += `\n⚠️ ไม่พบบัญชีในเว็บ (ยังไม่ผูก Discord): ${notFound.map(id => `<@${id}>`).join(', ')}`;
-                }
+                if (out.noShow.length) summary += `\n🚫 ไม่ได้ลงแข่งเลย ไม่ได้ EXP: ${out.noShow.map(n => (n.discord_id ? `<@${n.discord_id}>` : n.name)).join(', ')}`;
+                if (out.skipped.length) summary += `\n⚠️ ไม่พบบัญชี (walk-in/ยังไม่ผูก Discord): ${out.skipped.map(s => s.name).join(', ')}`;
 
                 return await interaction.editReply({ content: summary.substring(0, 1900), components: [] });
-
             } catch (error) {
-                console.error("Finish Error:", error.response?.data || error.message);
-                
-                // ถ้ายิง Finalize ไม่ผ่าน (เพราะแข่งยังไม่จบ หรือกรอกคะแนนไม่ครบ) จะเด้งมาตรงนี้ทันที บอทจะปลอดภัย
-                if (error.response?.status === 422) {
-                    return await interaction.editReply('⚠️ ไม่สามารถปิดจ็อบได้ ตรวจสอบใน Challonge ว่ามีคู่ไหนยังไม่ได้กรอกผลการแข่งบ้างครับ');
-                }
-                
-                return await interaction.editReply('❌ เกิดข้อผิดพลาด กรุณาตรวจสอบ Log');
+                return await interaction.editReply(`❌ ${errText(error)}`);
             }
         }
-        
+
+
         // =========================
         // 🔄 REFRESH LEADERBOARD
         // =========================
