@@ -14,6 +14,111 @@ const tournamentTimers = new Map(); // หน่วยความจำสำ�
 const activePolls = new Map();
 const pendingFinish = new Map(); // เก็บสถานะ "ติ๊กคนเล่นครบทุกรอบ" ก่อนกดยืนยันปิดจ็อบ
 
+// =========================================================
+// 🔐 กันคีย์หลุดใน log
+// 1) ปิด error ของ axios ให้เหลือแค่ข้อมูลที่จำเป็น (ตัด config/params/headers ที่มี api_key, apikey, Bearer, x-bot-secret ทิ้ง)
+// 2) ครอบ console.* ให้เซ็นเซอร์ค่าลับทุกตัวอีกชั้น เผื่อหลุดมาจากที่อื่น
+// =========================================================
+const util = require('util');
+const SECRET_VALUES = [
+    process.env.DISCORD_TOKEN,
+    process.env.CHALLONGE_API_KEY,
+    process.env.SUPABASE_SERVICE_KEY,
+    process.env.BOT_BRIDGE_SECRET,
+    process.env.BOT_BRIDGE_URL,
+].filter(v => typeof v === 'string' && v.trim().length >= 8).map(v => v.trim());
+
+function redact(text) {
+    if (typeof text !== 'string') return text;
+    let out = text;
+    for (const secret of SECRET_VALUES) out = out.split(secret).join('***');
+    return out
+        .replace(/(api_key=)[^&\s'"]+/gi, '$1***')
+        .replace(/(Bearer\s+)[A-Za-z0-9._~+\/=-]+/g, '$1***')
+        .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+/g, '***JWT***')
+        .replace(/sb_secret_[A-Za-z0-9_-]+/g, 'sb_secret_***');
+}
+
+function toSafeHttpError(err) {
+    if (!axios.isAxiosError(err)) return err;
+    const cfg = err.config || {};
+    const safe = new Error(redact(err.message));
+    safe.name = 'HttpError';
+    safe.isAxiosError = true;
+    safe.code = err.code;
+    safe.method = (cfg.method || '').toUpperCase();
+    safe.url = redact(String(cfg.url || '').split('?')[0]); // ไม่เอา query string
+    if (err.response) {
+        safe.response = {
+            status: err.response.status,
+            statusText: err.response.statusText,
+            headers: err.response.headers,
+            data: err.response.data,
+        };
+    }
+    safe.stack = `${safe.name}: ${safe.message} [${safe.method} ${safe.url}${safe.response ? ' → HTTP ' + safe.response.status : ''}]`;
+    return safe;
+}
+axios.interceptors.response.use(res => res, err => Promise.reject(toSafeHttpError(err)));
+
+for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
+    const original = console[level].bind(console);
+    console[level] = (...args) => original(redact(util.format(...args)));
+}
+
+// =========================================================
+// ⚡ Cache สั้นๆ ของข้อมูลทัวร์นาเมนต์ (กันยิง Challonge ซ้ำภายในไม่กี่วินาที)
+// - ภายใน TTL จะคืนข้อมูลเดิม, ถ้ามีคำขอเดิมกำลังวิ่งอยู่จะรอผลเดียวกัน (ไม่ยิงซ้ำ)
+// - ถ้าโดน 429 จะจำเวลาพักไว้ ไม่ยิงเพิ่มจนกว่าจะพ้นเวลา Retry-After
+// =========================================================
+const TOURNEY_CACHE_TTL_MS = 5000;
+const tourneyCache = new Map(); // key -> { at, data } หรือ { promise }
+let challongeCooldownUntil = 0;
+
+function parseRetryAfterSec(value) {
+    if (value === undefined || value === null || value === '') return null;
+    const n = Number(value);
+    if (Number.isFinite(n)) return Math.max(1, Math.ceil(n));
+    const dateMs = Date.parse(value);
+    if (!Number.isNaN(dateMs)) return Math.max(1, Math.ceil((dateMs - Date.now()) / 1000));
+    return null;
+}
+
+async function getTournamentFull(tournamentId) {
+    const key = String(tournamentId).trim().toLowerCase();
+    const now = Date.now();
+
+    for (const [k, v] of tourneyCache) if (v.at && now - v.at >= TOURNEY_CACHE_TTL_MS) tourneyCache.delete(k);
+
+    const hit = tourneyCache.get(key);
+    if (hit?.promise) return structuredClone(await hit.promise);
+    if (hit?.data) return structuredClone(hit.data);
+
+    if (now < challongeCooldownUntil) {
+        const err = new Error('Challonge rate limit cooldown (local)');
+        err.response = { status: 429, headers: { 'retry-after': String(Math.ceil((challongeCooldownUntil - now) / 1000)) } };
+        err.fromLocalCooldown = true;
+        throw err;
+    }
+
+    const promise = axios.get(`https://api.challonge.com/v1/tournaments/${encodeURIComponent(tournamentId)}.json`, {
+        params: { api_key: CHALLONGE_API_KEY, include_participants: 1, include_matches: 1 }
+    }).then(res => {
+        tourneyCache.set(key, { at: Date.now(), data: res.data });
+        return res.data;
+    }).catch(err => {
+        tourneyCache.delete(key);
+        if (err.response?.status === 429) {
+            const sec = parseRetryAfterSec(err.response.headers?.['retry-after']) ?? 60;
+            challongeCooldownUntil = Date.now() + sec * 1000;
+        }
+        throw err;
+    });
+
+    tourneyCache.set(key, { promise });
+    return structuredClone(await promise);
+}
+
 // กำหนดค่าต่างๆ ของคุณที่นี่ (ดึงจาก Environment Variables ปลอดภัย 100%)
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHALLONGE_API_KEY = process.env.CHALLONGE_API_KEY;
@@ -473,9 +578,7 @@ client.on('messageCreate', async message => {
         if (!tournamentId) return message.reply('⚠️ ใส่ ID ทัวร์นาเมนต์ด้วยครับ');
 
         try {
-            const res = await axios.get(`https://api.challonge.com/v1/tournaments/${tournamentId}.json`, {
-                params: { api_key: CHALLONGE_API_KEY, include_participants: 1, include_matches: 1 }
-            });
+            const res = { data: await getTournamentFull(tournamentId) }; // ⚡ ผ่าน cache 5 วิ
             
             // 🎯 1. เช็กสถานะว่าทัวร์นาเมนต์จบหรือยัง
             const tourneyState = res.data.tournament.state;
@@ -604,8 +707,28 @@ client.on('messageCreate', async message => {
             setTimeout(() => message.delete().catch(() => {}), 1000);
 
         } catch (error) {
-            console.error(error);
-            message.channel.send('❌ ไม่สามารถดึงข้อมูลตารางคะแนนได้');
+            const status = error.response?.status;
+
+            if (status === 429) {
+                const retrySec = parseRetryAfterSec(error.response.headers?.['retry-after']);
+                const waitText = retrySec ? `${retrySec} วินาที` : 'ประมาณ 1 นาที';
+                console.warn(`⏳ [!standing] Challonge 429 Too Many Requests | tournament=${tournamentId} | retry-after=${retrySec ?? 'n/a'}s${error.fromLocalCooldown ? ' | (บล็อกจาก cooldown ในบอท ไม่ได้ยิง API)' : ''}`);
+                await message.channel.send(
+                    `⏳ **Challonge จำกัดจำนวนการเรียก API ชั่วคราว (HTTP 429 Too Many Requests)**\n` +
+                    `บอทดึงตารางคะแนนของ \`${tournamentId}\` ไม่ได้ในตอนนี้ — กรุณารอ **${waitText}** แล้วพิมพ์ \`!standing ${tournamentId}\` ใหม่ครับ\n` +
+                    `-# ระหว่างนี้บอทจะพักการเรียก Challonge อัตโนมัติ ไม่ต้องกดซ้ำ`
+                ).catch(() => {});
+                return;
+            }
+
+            let reason = 'ไม่สามารถดึงข้อมูลตารางคะแนนได้';
+            if (status === 404) reason = `ไม่พบทัวร์นาเมนต์ ID \`${tournamentId}\` (เช็ก ID อีกครั้ง)`;
+            else if (status === 401 || status === 403) reason = 'Challonge ปฏิเสธคีย์ (401/403) — ตรวจ CHALLONGE_API_KEY ใน .env';
+            else if (status >= 500) reason = `เซิร์ฟเวอร์ Challonge มีปัญหา (HTTP ${status}) ลองใหม่อีกสักครู่`;
+            else if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') reason = 'Challonge ตอบช้าเกิน 8 วินาที ลองใหม่อีกครั้ง';
+
+            console.error(`❌ [!standing] tournament=${tournamentId} | ${status ? 'HTTP ' + status : (error.code || 'no-response')} | ${error.message}`);
+            await message.channel.send(`❌ ${reason}`).catch(() => {});
         }
     }
 
@@ -1018,11 +1141,31 @@ client.on('interactionCreate', async interaction => {
             }
 
             try {
+                // 🔀 1) สุ่ม seed ผู้เล่นใหม่ (Shuffle Seeds) ก่อนเริ่ม — Challonge ทำได้เฉพาะตอนยังไม่เริ่มแข่ง
+                try {
+                    await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/participants/randomize.json`, {}, {
+                        params: { api_key: CHALLONGE_API_KEY }
+                    });
+                } catch (shuffleError) {
+                    const errs = [].concat(shuffleError.response?.data?.errors || []).join(' ');
+                    if (/already.*(started|underway)|in progress|underway/i.test(errs)) {
+                        return await interaction.editReply('⚠️ ทัวร์นาเมนต์นี้เริ่มแล้ว (สุ่ม seed ไม่ได้)');
+                    }
+                    const status = shuffleError.response?.status;
+                    console.error(`❌ [start] Shuffle seeds ล้มเหลว | tournament=${tournamentId} | ${status ? 'HTTP ' + status : (shuffleError.code || 'no-response')} | ${errs || shuffleError.message}`);
+                    const why = status === 429
+                        ? 'Challonge จำกัดจำนวนการเรียก API ชั่วคราว (429) รอสักครู่แล้วกดใหม่'
+                        : (errs || shuffleError.message);
+                    return await interaction.editReply(`❌ สุ่ม seed ไม่สำเร็จ จึง**ยังไม่เริ่มแข่ง**\n> ${why}`);
+                }
+
+                // 🟢 2) เริ่มแข่ง
                 await axios.post(`https://api.challonge.com/v1/tournaments/${tournamentId}/start.json`, {}, {
                     params: { api_key: CHALLONGE_API_KEY }
                 });
+                tourneyCache.delete(String(tournamentId).trim().toLowerCase()); // ล้าง cache ให้ !standing เห็นสายใหม่ทันที
 
-                return await interaction.editReply('✅ เริ่มแข่งขันแล้ว!');
+                return await interaction.editReply('🔀 สุ่ม seed เรียบร้อย\n✅ เริ่มแข่งขันแล้ว!');
             } catch (error) {
                 if (error.response?.data?.errors?.includes('Tournament has already been started')) {
                     return await interaction.editReply('⚠️ ทัวร์นาเมนต์นี้เริ่มแล้ว');
