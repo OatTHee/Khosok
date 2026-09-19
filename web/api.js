@@ -1,6 +1,7 @@
 // =========================================================
-// 🌐 API สำหรับเว็บจัดทัวร์ (แอดมินเท่านั้น)
-// login ด้วยบัญชี Supabase เดียวกับเว็บ DMT Shop แล้วเช็ก user_profiles.role = 'admin'
+// 🌐 API สำหรับเว็บจัดทัวร์
+// login ด้วยบัญชี Supabase เดียวกับเว็บ DMT Shop
+// สิทธิ์: แอดมินร้าน = ทุกอย่าง + แต่งตั้งสตาฟ · สตาฟ (Discord ID ใน tournament_staff) = จัดการทัวร์
 // =========================================================
 'use strict';
 const path = require('path');
@@ -13,7 +14,8 @@ const DEFAULT_PUBLISHABLE_KEY = 'sb_publishable_mwPhY8NkaiB7H1ppaavysA_5jKVAgFl'
 
 const tokenCache = new Map(); // token -> { user, until }
 
-async function requireAdmin(req, res, next) {
+// ผ่านได้ถ้าเป็นแอดมินร้าน หรือสตาฟที่ถูกแต่งตั้ง (ดู tournament/service.js → resolveRole)
+async function requireStaff(req, res, next) {
     try {
         const m = /^Bearer\s+(.+)$/i.exec(req.get('authorization') || '');
         if (!m) return res.status(401).json({ error: 'กรุณาเข้าสู่ระบบ' });
@@ -25,15 +27,28 @@ async function requireAdmin(req, res, next) {
         const { data, error } = await S.db().auth.getUser(token);
         if (error || !data?.user) return res.status(401).json({ error: 'เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่' });
 
-        const { data: prof } = await S.db().from('user_profiles').select('role').eq('id', data.user.id).maybeSingle();
-        if (prof?.role !== 'admin') return res.status(403).json({ error: 'บัญชีนี้ไม่ใช่แอดมิน' });
+        const { role, discordIds } = await S.resolveRole(data.user);
+        if (!role) {
+            return res.status(403).json({
+                error: discordIds.length
+                    ? 'บัญชีนี้ยังไม่ได้รับสิทธิ์จัดทัวร์ — ให้แอดมินเพิ่ม Discord ID ของคุณเป็นสตาฟก่อน'
+                    : 'บัญชีนี้ยังไม่ได้ผูก Discord — ออกจากระบบแล้วเข้าใหม่ด้วยปุ่ม "เข้าสู่ระบบด้วย Discord"',
+                discordIds,
+            });
+        }
 
-        const user = { id: data.user.id, email: data.user.email, name: data.user.user_metadata?.full_name || data.user.user_metadata?.name || data.user.email };
-        tokenCache.set(token, { user, until: Date.now() + 60_000 });
+        const meta = data.user.user_metadata || {};
+        const user = { id: data.user.id, email: data.user.email, name: meta.full_name || meta.name || data.user.email, role, discordIds };
+        tokenCache.set(token, { user, until: Date.now() + 30_000 });
         if (tokenCache.size > 500) for (const [k, v] of tokenCache) if (v.until < Date.now()) tokenCache.delete(k);
         req.user = user;
         next();
     } catch (err) { next(err); }
+}
+
+function adminOnly(req, res, next) {
+    if (req.user?.role !== 'admin') return res.status(403).json({ error: 'เฉพาะแอดมินร้านเท่านั้นที่จัดการสตาฟได้' });
+    next();
 }
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res)).then(data => res.json(data ?? { ok: true })).catch(next);
@@ -50,8 +65,18 @@ function buildRouter() {
         });
     });
 
-    r.use(requireAdmin);
+    r.use(requireStaff);
     r.get('/me', (req, res) => res.json(req.user));
+
+    // 🛡️ จัดการสตาฟ (แอดมินร้านเท่านั้น)
+    r.get('/staff', adminOnly, wrap(() => S.listStaff()));
+    r.post('/staff', adminOnly, wrap(req => S.addStaff(req.body?.discord_id, req.body?.note, req.user.id)));
+    r.delete('/staff/:discordId', adminOnly, wrap(async req => {
+        const out = await S.removeStaff(req.params.discordId);
+        // เตะเซสชันที่แคชไว้ทิ้ง ให้สิทธิ์หายทันที
+        for (const [k, v] of tokenCache) if (v.user.discordIds?.includes(out.discord_id) && v.user.role !== 'admin') tokenCache.delete(k);
+        return out;
+    }));
 
     r.get('/tournaments', wrap(() => S.listTournaments()));
     r.post('/tournaments', wrap(req => S.createTournament(req.body || {}, req.user.id)));

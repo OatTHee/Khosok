@@ -111,12 +111,15 @@ async function route() {
     try { S.me = await api('GET', '/me'); }
     catch (e) {
       $('#userbox').hidden = false; $('#username').textContent = S.session.user?.email || '';
-      $('#app').innerHTML = `<div class="login"><div class="card"><h2>เข้าใช้งานไม่ได้</h2><p class="muted">${esc(e.message)}</p><p class="small muted">ต้องเป็นบัญชีที่มีสิทธิ์แอดมินในเว็บ DMT Shop</p></div></div>`;
+      $('#staff-link').hidden = true;
+      $('#app').innerHTML = `<div class="login"><div class="card"><h2>เข้าใช้งานไม่ได้</h2><p class="muted">${esc(e.message)}</p><p class="small muted">เว็บนี้ใช้ได้เฉพาะแอดมินร้านและสตาฟจัดทัวร์ที่ได้รับแต่งตั้ง</p></div></div>`;
       return;
     }
   }
   $('#userbox').hidden = false;
-  $('#username').textContent = S.me.name || S.me.email || '';
+  $('#username').textContent = `${S.me.name || S.me.email || ''} · ${S.me.role === 'admin' ? 'แอดมิน' : 'สตาฟ'}`;
+  $('#staff-link').hidden = S.me.role !== 'admin';
+  if (location.hash.startsWith('#/staff')) { S.code = null; return renderStaff(); }
   const m = location.hash.match(/^#\/t\/([\w-]+)/);
   if (m) {
     if (S.code !== m[1]) { S.code = m[1]; S.tab = null; S.round = null; S.finishChecks = null; S.lastJson = ''; S.view = null; }
@@ -609,6 +612,50 @@ function renderFinish(el, v) {
     act(() => api('POST', `/tournaments/${t.code}/finish`, { playedAllIds: [...S.finishChecks] }),
       out => `ปิดจ็อบแล้ว แจก EXP ${out.awarded.length} คน${out.skipped.length ? ` · ข้าม ${out.skipped.length} คน` : ''}`, fin);
   };
+}
+
+// ---------- staff (แอดมินร้านเท่านั้น) ----------
+async function renderStaff() {
+  if (S.me?.role !== 'admin') { $('#app').innerHTML = '<div class="empty">เฉพาะแอดมินร้านเท่านั้น<br><br><a href="#/">← กลับ</a></div>'; return; }
+  $('#app').innerHTML = '<div class="loading">กำลังโหลด…</div>';
+  let list;
+  try { list = await api('GET', '/staff'); } catch (e) { $('#app').innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+  $('#app').innerHTML = `
+    <a href="#/" class="small muted" style="text-decoration:none">← งานแข่งทั้งหมด</a>
+    <div class="spread" style="margin:8px 0 16px"><h1>สตาฟจัดทัวร์</h1></div>
+    <div class="stack">
+      <div class="notice">สตาฟจัดการทัวร์ได้ทุกอย่าง (สร้างงาน กรอกผล แจกรางวัล) แต่แต่งตั้งสตาฟคนอื่นไม่ได้ · สตาฟต้อง login ด้วย Discord (หรือบัญชีเว็บร้านที่ผูก Discord แล้ว)</div>
+      <form class="card pad row" id="staff-add">
+        <label class="field" style="flex:2;min-width:200px">Discord ID<input name="discord_id" inputmode="numeric" pattern="[0-9]{17,20}" required placeholder="เช่น 123456789012345678"><span class="hint">Discord → ตั้งค่า → ขั้นสูง → เปิด Developer Mode แล้วคลิกขวาที่ชื่อ → Copy User ID</span></label>
+        <label class="field" style="flex:1;min-width:140px">โน้ต (ไม่บังคับ)<input name="note" maxlength="80" placeholder="เช่น ชื่อเล่น"></label>
+        <button class="btn" style="align-self:flex-end;margin-bottom:22px">+ เพิ่มสตาฟ</button>
+      </form>
+      <div class="card table-wrap">
+        <table>
+          <thead><tr><th>Discord ID</th><th>ชื่อในระบบ</th><th class="hide-sm">โน้ต</th><th class="hide-sm">เพิ่มเมื่อ</th><th></th></tr></thead>
+          <tbody>${list.length ? list.map(s => `<tr>
+            <td><span class="code">${esc(s.discord_id)}</span></td>
+            <td>${s.name ? esc(s.name) : '<span class="muted small">ยังไม่มีบัญชีในเว็บ</span>'}</td>
+            <td class="hide-sm">${esc(s.note || '')}</td>
+            <td class="hide-sm small muted">${fmtDate(s.created_at)}</td>
+            <td style="text-align:right"><button class="btn ghost sm" data-unstaff="${esc(s.discord_id)}">ถอดสิทธิ์</button></td>
+          </tr>`).join('') : '<tr><td colspan="5" class="empty">ยังไม่มีสตาฟ — แอดมินร้านจัดทัวร์ได้อยู่แล้วโดยไม่ต้องเพิ่ม</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>`;
+  const f = $('#staff-add');
+  f.onsubmit = async ev => {
+    ev.preventDefault();
+    const d = new FormData(f), btn = f.querySelector('button');
+    btn.disabled = true;
+    try { await api('POST', '/staff', { discord_id: String(d.get('discord_id')).trim(), note: d.get('note') }); toast('เพิ่มสตาฟแล้ว'); renderStaff(); }
+    catch (e) { toast(e.message, true); btn.disabled = false; }
+  };
+  document.querySelectorAll('[data-unstaff]').forEach(b => b.onclick = async () => {
+    const row = list.find(x => x.discord_id === b.dataset.unstaff);
+    if (!await confirmBox('ถอดสิทธิ์สตาฟ?', `${esc(row.name || row.discord_id)} จะจัดการทัวร์ไม่ได้อีก (มีผลทันที)`, 'ถอดสิทธิ์', true)) return;
+    try { await api('DELETE', `/staff/${row.discord_id}`); toast('ถอดสิทธิ์แล้ว'); renderStaff(); } catch (e) { toast(e.message, true); }
+  });
 }
 
 // ---------- settings tab ----------

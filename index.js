@@ -19,6 +19,13 @@ const activePolls = new Map();
 const pendingFinish = new Map(); // เก็บสถานะ "ติ๊กคนเล่นครบทุกรอบ" ก่อนกดยืนยันปิดจ็อบ
 const COMPETITOR_ROLE_ID = '1476156740738486457';
 
+// 🛡️ สิทธิ์จัดทัวร์ใน Discord: คนที่มีสิทธิ์ Manage Messages ในเซิร์ฟ หรือสตาฟที่แอดมินแต่งตั้งจากเว็บ
+async function canManageTour(member) {
+    if (!member) return false;
+    if (member.permissions?.has('ManageMessages')) return true;
+    try { return await T.isStaffDiscord(member.id || member.user?.id); } catch { return false; }
+}
+
 
 // =========================================================
 // 🔐 กันคีย์หลุดใน log
@@ -447,7 +454,7 @@ client.on('messageCreate', async message => {
     // 🔒 ระบบป้องกัน: เช็กสิทธิ์เฉพาะคำสั่งของแอดมิน
     const adminCommands = ['!help', '!setup', '!current', '!standing', '!rank'];
     if (adminCommands.includes(command)) {
-        if (!message.member.permissions.has('ManageMessages')) {
+        if (!(await canManageTour(message.member))) {
             // ถ้าไม่ใช่แอดมินพิมพ์คำสั่งพวกนี้ ให้บอทเงียบและเมินไปเลย
             return; 
         }
@@ -606,7 +613,7 @@ client.on('messageCreate', async message => {
     }
 
     if (command === '!pollchamp') {
-        if (!message.member.permissions.has('ManageMessages')) return message.reply('⛔ คุณไม่มีสิทธิ์สร้างโพลล์ครับ');
+        if (!(await canManageTour(message.member))) return message.reply('⛔ คุณไม่มีสิทธิ์สร้างโพลล์ครับ');
 
         const pollTourneyId = message.content.split(' ')[1];
         if (!pollTourneyId) return message.reply('⚠️ ฟอร์แมตผิดครับ ใช้: `!pollchamp <เลขงาน>`');
@@ -698,7 +705,7 @@ client.on('interactionCreate', async interaction => {
 
             // ✅ ติ๊กคนที่เล่นครบทุกรอบ (ก่อนปิดจ็อบ)
             if (interaction.customId.startsWith('fullplay_')) {
-                if (!interaction.member.permissions.has('ManageMessages')) {
+                if (!(await canManageTour(interaction.member))) {
                     return await interaction.reply({ content: '⛔ เฉพาะแอดมินเท่านั้น', ephemeral: true });
                 }
 
@@ -725,7 +732,7 @@ client.on('interactionCreate', async interaction => {
 
             const tourneyId = interaction.customId.split('_')[1];
 
-            const isAdmin = interaction.member.permissions.has('ManageMessages');
+            const isAdmin = await canManageTour(interaction.member);
             const isCompetitor = interaction.member.roles.cache.has(COMPETITOR_ROLE_ID);
 
             if (!isAdmin && !isCompetitor) {
@@ -775,7 +782,7 @@ client.on('interactionCreate', async interaction => {
         // 🔴 POLL CLOSE
         // =========================
         if (action === 'pollclose') {
-            if (!interaction.member.permissions.has('ManageMessages')) {
+            if (!(await canManageTour(interaction.member))) {
                 return await interaction.editReply('⛔ สิทธิ์ไม่พอ');
             }
 
@@ -857,7 +864,7 @@ client.on('interactionCreate', async interaction => {
         // 🟣 START (ปิดรับสมัคร → สุ่ม seed → จับคู่รอบแรก)
         // =========================
         if (action === 'start') {
-            if (!interaction.member.permissions.has('ManageMessages')) {
+            if (!(await canManageTour(interaction.member))) {
                 return await interaction.editReply('⛔ เฉพาะแอดมิน');
             }
             try {
@@ -873,7 +880,7 @@ client.on('interactionCreate', async interaction => {
         // ⏱️ TIMER
         // =========================
         if (action === 'timer') {
-            if (!interaction.member.permissions.has('ManageMessages')) {
+            if (!(await canManageTour(interaction.member))) {
                 return await interaction.editReply('⛔ เฉพาะแอดมิน');
             }
             try {
@@ -888,7 +895,7 @@ client.on('interactionCreate', async interaction => {
         // 💸 REWARD (ปุ่มแจกแต้ม)
         // =========================
         if (action === 'reward') {
-            if (!interaction.member.permissions.has('ManageMessages')) return await interaction.editReply('⛔ เฉพาะแอดมิน');
+            if (!(await canManageTour(interaction.member))) return await interaction.editReply('⛔ เฉพาะแอดมิน');
             try {
                 const res = await T.awardPoints(tournamentId);
                 let text = `✅ แจกแต้มให้ Top ${res.quota} เรียบร้อย! (แชมป์ 10 แต้ม, อันดับอื่น 5 แต้ม — รวมผู้ได้รับ ${res.awarded.length} คน)`;
@@ -904,7 +911,7 @@ client.on('interactionCreate', async interaction => {
         // ==========================================
         // ขั้นที่ 1: ขึ้นรายการให้แอดมินติ๊กคนที่เล่นครบทุกรอบก่อน
         if (action === 'finish') {
-            if (!interaction.member.permissions.has('ManageMessages')) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
+            if (!(await canManageTour(interaction.member))) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
 
             try {
                 const v = await T.view(tournamentId);
@@ -950,7 +957,7 @@ client.on('interactionCreate', async interaction => {
 
         // ขั้นที่ 2: ยืนยันแล้ว → ปิดจ็อบ + แจก EXP (ธุรกรรมเดียวใน Supabase)
         if (action === 'fullall' || action === 'fullconfirm') {
-            if (!interaction.member.permissions.has('ManageMessages')) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
+            if (!(await canManageTour(interaction.member))) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
 
             const state = pendingFinish.get(String(tournamentId));
             if (!state) return await interaction.editReply('❌ รายการนี้หมดอายุแล้ว กดปุ่ม "ปิดจ็อบ" ใหม่อีกครั้งครับ');

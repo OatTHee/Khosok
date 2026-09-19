@@ -25,7 +25,7 @@ function db() {
 async function run(query, notFoundMsg) {
     const { data, error } = await query;
     if (error) {
-        if (error.code === '23505') throw new ServiceError('ข้อมูลซ้ำ (ผู้เล่นคนนี้อยู่ในงานแล้ว)');
+        if (error.code === '23505') throw new ServiceError(/tournament_staff/.test(error.message) ? 'คนนี้เป็นสตาฟอยู่แล้ว' : 'ข้อมูลซ้ำ (ผู้เล่นคนนี้อยู่ในงานแล้ว)');
         if (error.code === 'PGRST116' && notFoundMsg) throw new ServiceError(notFoundMsg, 404);
         // ข้อความ raise exception จากฟังก์ชัน SQL เป็นภาษาไทยอยู่แล้ว ส่งต่อได้เลย
         if (error.code === 'P0001') throw new ServiceError(error.message);
@@ -468,7 +468,78 @@ async function finish(idOrCode, { playedAllIds } = {}) {
     return out;
 }
 
+
+// ---------------------------------------------------------
+// 🛡️ สิทธิ์: แอดมินร้าน (user_profiles.role = 'admin') = จัดการทัวร์ + แต่งตั้งสตาฟ
+//          สตาฟ (tournament_staff.discord_id) = จัดการทัวร์อย่างเดียว
+// ---------------------------------------------------------
+const DISCORD_ID_RE = /^\d{17,20}$/;
+let staffCache = { at: 0, ids: new Set() };
+const STAFF_TTL_MS = 30_000;
+
+async function staffIds(force = false) {
+    if (!force && Date.now() - staffCache.at < STAFF_TTL_MS) return staffCache.ids;
+    const rows = await run(db().from('tournament_staff').select('discord_id'));
+    staffCache = { at: Date.now(), ids: new Set(rows.map(r => r.discord_id)) };
+    return staffCache.ids;
+}
+async function isStaffDiscord(discordId) {
+    if (!discordId) return false;
+    return (await staffIds()).has(String(discordId));
+}
+
+// Discord ID ของผู้ใช้เว็บ: จาก identity ที่ login ด้วย Discord หรือที่ผูกไว้ในตาราง customers
+async function discordIdsOfUser(user) {
+    const ids = new Set();
+    for (const i of user.identities || []) {
+        if (i.provider !== 'discord') continue;
+        const v = i.identity_data?.provider_id || i.identity_data?.sub || i.id;
+        if (v && DISCORD_ID_RE.test(String(v))) ids.add(String(v));
+    }
+    const c = await run(db().from('customers').select('discord_id').eq('id', user.id).maybeSingle());
+    if (c?.discord_id) ids.add(String(c.discord_id));
+    return [...ids];
+}
+
+// คืน 'admin' | 'staff' | null
+async function resolveRole(user) {
+    const prof = await run(db().from('user_profiles').select('role').eq('id', user.id).maybeSingle());
+    if (prof?.role === 'admin') return { role: 'admin', discordIds: await discordIdsOfUser(user) };
+    const ids = await discordIdsOfUser(user);
+    const staff = await staffIds();
+    if (ids.some(id => staff.has(id))) return { role: 'staff', discordIds: ids };
+    return { role: null, discordIds: ids };
+}
+
+async function listStaff() {
+    const rows = await run(db().from('tournament_staff').select('*').order('created_at'));
+    if (!rows.length) return [];
+    const ids = rows.map(r => r.discord_id);
+    const [cs, ls] = await Promise.all([
+        run(db().from('customers').select('discord_id, display_name').in('discord_id', ids)),
+        run(db().from('legacy_accounts').select('discord_id, name').in('discord_id', ids)),
+    ]);
+    const nameOf = Object.fromEntries([...ls.map(l => [l.discord_id, l.name]), ...cs.map(c => [c.discord_id, c.display_name])]);
+    return rows.map(r => ({ ...r, name: nameOf[r.discord_id] || null }));
+}
+
+async function addStaff(discordId, note, byUserId) {
+    const id = String(discordId ?? '').trim();
+    if (!DISCORD_ID_RE.test(id)) throw new ServiceError('Discord ID ต้องเป็นตัวเลข 17–20 หลัก (คลิกขวาที่ชื่อใน Discord → Copy User ID)');
+    const row = await run(db().from('tournament_staff').insert({ discord_id: id, note: clean(note, 80) || null, added_by: byUserId || null }).select().single());
+    await staffIds(true);
+    return row;
+}
+
+async function removeStaff(discordId) {
+    const rows = await run(db().from('tournament_staff').delete().eq('discord_id', String(discordId)).select());
+    if (!rows.length) throw new ServiceError('ไม่พบสตาฟคนนี้', 404);
+    await staffIds(true);
+    return rows[0];
+}
+
 module.exports = {
+    isStaffDiscord, resolveRole, listStaff, addStaff, removeStaff,
     ServiceError, events, db,
     getTournament, getFull, view, buildView, listTournaments,
     createTournament, updateTournament, cancelTournament, setDiscordRefs,
