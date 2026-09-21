@@ -127,3 +127,25 @@ test('rewards preview: no-show gets nothing, played_all respected', () => {
     assert.strictEqual(by.p4.exp, 0);
     assert.strictEqual(by.p2.exp, 40); // rank3? check below
 });
+
+test('custom reward config per tournament', () => {
+    const cfg = { points: { ranks: [20, 10, 5, 2], base_top: 2, expand_min_players: 6, expand_top: 4 }, exp: { ranks: [100, 50], join: 5, full_play: 0 } };
+    assert.deepStrictEqual([1, 2, 3, 4, 5].map(r => E.calcPoints(r, 5, cfg)), [20, 10, 0, 0, 0]);
+    assert.deepStrictEqual([1, 2, 3, 4, 5].map(r => E.calcPoints(r, 6, cfg)), [20, 10, 5, 2, 0]);
+    assert.deepStrictEqual([1, 2, 3].map(r => E.calcExp(r, true, cfg)), [105, 55, 5]);
+    // ไม่ขยายโควตา
+    const noExpand = { ...cfg, points: { ...cfg.points, expand_min_players: 0 } };
+    assert.strictEqual(E.pointsQuota(100, noExpand), 2);
+    // null = เกณฑ์มาตรฐาน
+    assert.deepStrictEqual(E.normalizeRewards(null), JSON.parse(JSON.stringify(E.DEFAULT_REWARDS)));
+    assert.match(E.describePoints(null), /Top 3.*แชมป์ \*\*10\*\*/);
+    assert.match(E.describePoints(null), /ครบ \*\*10 คน\*\* ขยายเป็น \*\*Top 5\*\*/);
+});
+
+test('rewardsPreview respects give_points / give_exp', () => {
+    const { players, matches } = playSwiss(8, 3);
+    const on = E.rewardsPreview({ format: 'swiss', swiss_rounds: 3 }, players, matches);
+    assert.ok(on.some(r => r.points > 0) && on.some(r => r.exp > 0));
+    const off = E.rewardsPreview({ format: 'swiss', swiss_rounds: 3, give_points: false, give_exp: false }, players, matches);
+    assert.ok(off.every(r => r.points === 0 && r.exp === 0));
+});

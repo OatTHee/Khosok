@@ -99,7 +99,8 @@ function buildRouter() {
     r.delete('/tournaments/:id/timer', wrap(req => S.stopTimer(req.params.id)));
 
     r.post('/tournaments/:id/award-points', wrap(req => S.awardPoints(req.params.id)));
-    r.post('/tournaments/:id/finish', wrap(req => S.finish(req.params.id, { playedAllIds: req.body?.playedAllIds })));
+    r.post('/tournaments/:id/award-exp', wrap(req => S.awardExp(req.params.id, { playedAllIds: req.body?.playedAllIds })));
+    r.post('/tournaments/:id/finish', wrap(req => S.finish(req.params.id)));
 
     // eslint-disable-next-line no-unused-vars
     r.use((err, req, res, next) => {

@@ -160,3 +160,25 @@ dialog form { padding: 18px; display: flex; flex-direction: column; gap: 14px; }
   #username { display: none; }
   .bcol { min-width: 170px; }
 }
+
+/* รางวัล (2026-09-21) */
+dialog { max-height: calc(100vh - 32px); }
+dialog form { max-height: calc(100vh - 34px); overflow-y: auto; }
+textarea { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; width: 100%; resize: vertical; min-height: 64px; }
+textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.badge.gold { background: color-mix(in srgb, var(--gold) 16%, var(--surface)); color: var(--gold); }
+.badge.off { background: transparent; border: 1px dashed var(--border); color: var(--muted); text-decoration: line-through; font-weight: 500; }
+.rw { display: flex; flex-direction: column; gap: 10px; }
+.rw-block { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+.rw-block.off > :not(.rw-toggle) { display: none; }
+.rw-toggle { display: flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; }
+.rw-toggle .hint { margin-left: auto; }
+.rank-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 6px; }
+.rank-grid label { display: flex; flex-direction: column; gap: 2px; font-size: .78rem; color: var(--muted); }
+.rank-grid label.extra { color: var(--gold); }
+.rank-grid input, .rw-nums input { width: 100%; }
+.rw-nums { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
+.rw-nums label { display: flex; flex-direction: column; gap: 2px; font-size: .8rem; }
+.rw-preview { font-size: .82rem; color: var(--muted); background: var(--surface-2); border-radius: 8px; padding: 6px 10px; white-space: pre-line; }
+.rw-locked { font-size: .8rem; color: var(--warn); }
+.badges { display: inline-flex; gap: 4px; flex-wrap: wrap; }

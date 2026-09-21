@@ -4,25 +4,95 @@
 // =========================================================
 'use strict';
 
-// ---------- เกณฑ์รางวัล (ตรงกับ skill dinomaster-scoring) ----------
+// ---------- เกณฑ์รางวัล ----------
+// ค่าเริ่มต้นตรงกับ skill dinomaster-scoring — แต่ละงานตั้งเองได้ (tournaments.reward_config)
 const EXP_JOIN = 10;
 const EXP_FULL_PLAY = 10;
+const MAX_REWARD_RANKS = 16;
 
-function placementExp(rank) {
-    if (rank === 1) return 50;
-    if (rank <= 3) return 30;
-    if (rank <= 5) return 20;
-    return 0;
+const DEFAULT_REWARDS = Object.freeze({
+    points: { ranks: [10, 5, 5, 5, 5], base_top: 3, expand_min_players: 10, expand_top: 5 },
+    exp: { ranks: [50, 30, 30, 20, 20], join: EXP_JOIN, full_play: EXP_FULL_PLAY },
+});
+
+const int = (v, def, min = 0, max = 100000) => {
+    const n = Number(v);
+    return Number.isInteger(n) && n >= min && n <= max ? n : def;
+};
+
+// ทำความสะอาด config ที่มาจากฐานข้อมูล/หน้าเว็บ (ช่องไหนผิดใช้ค่าเริ่มต้น)
+function normalizeRewards(cfg) {
+    const c = cfg && typeof cfg === 'object' ? cfg : {};
+    const p = c.points || {}, e = c.exp || {};
+    const ranks = (arr, def) => (Array.isArray(arr) && arr.length
+        ? arr.slice(0, MAX_REWARD_RANKS).map(x => int(x, 0))
+        : def.slice());
+    const pts = {
+        ranks: ranks(p.ranks, DEFAULT_REWARDS.points.ranks),
+        base_top: int(p.base_top, DEFAULT_REWARDS.points.base_top, 0, MAX_REWARD_RANKS),
+        expand_min_players: int(p.expand_min_players, DEFAULT_REWARDS.points.expand_min_players, 0, 1000),
+        expand_top: int(p.expand_top, DEFAULT_REWARDS.points.expand_top, 0, MAX_REWARD_RANKS),
+    };
+    if (pts.expand_top < pts.base_top) pts.expand_top = pts.base_top;
+    return {
+        points: pts,
+        exp: {
+            ranks: ranks(e.ranks, DEFAULT_REWARDS.exp.ranks),
+            join: int(e.join, DEFAULT_REWARDS.exp.join),
+            full_play: int(e.full_play, DEFAULT_REWARDS.exp.full_play),
+        },
+    };
 }
-function calcExp(rank, playedAll) {
-    return placementExp(rank) + EXP_JOIN + (playedAll ? EXP_FULL_PLAY : 0);
+const rewardsOf = t => normalizeRewards(t?.reward_config);
+
+// expand_min_players = 0 → ไม่มีการขยายโควตา
+function pointsQuota(totalPlayers, cfg = DEFAULT_REWARDS) {
+    const p = normalizeRewards(cfg).points;
+    return p.expand_min_players > 0 && totalPlayers >= p.expand_min_players ? p.expand_top : p.base_top;
 }
-function pointsQuota(totalPlayers) {
-    return totalPlayers >= 10 ? 5 : 3;
+function calcPoints(rank, totalPlayers, cfg = DEFAULT_REWARDS) {
+    const c = normalizeRewards(cfg);
+    if (rank > pointsQuota(totalPlayers, c)) return 0;
+    return c.points.ranks[rank - 1] || 0;
 }
-function calcPoints(rank, totalPlayers) {
-    if (rank === 1) return 10;
-    return rank <= pointsQuota(totalPlayers) ? 5 : 0;
+function placementExp(rank, cfg = DEFAULT_REWARDS) {
+    return normalizeRewards(cfg).exp.ranks[rank - 1] || 0;
+}
+function calcExp(rank, playedAll, cfg = DEFAULT_REWARDS) {
+    const e = normalizeRewards(cfg).exp;
+    return (e.ranks[rank - 1] || 0) + e.join + (playedAll ? e.full_play : 0);
+}
+
+// จัดกลุ่มอันดับที่ได้ค่าเท่ากันติดกัน: [10,5,5] → [{from:1,to:1,v:10},{from:2,to:3,v:5}]
+function groupRanks(values, upto = values.length) {
+    const out = [];
+    for (let r = 1; r <= upto; r++) {
+        const v = values[r - 1] || 0;
+        const last = out[out.length - 1];
+        if (last && last.v === v) last.to = r; else out.push({ from: r, to: r, v });
+    }
+    return out.filter(g => g.v > 0);
+}
+const rankLabel = g => (g.from === 1 && g.to === 1 ? 'แชมป์' : g.from === g.to ? `อันดับ ${g.from}` : `อันดับ ${g.from}–${g.to}`);
+
+// ข้อความอธิบายการแจกแต้ม ใช้ทั้งบอร์ด !setup และหน้าเว็บ
+function describePoints(cfg) {
+    const p = normalizeRewards(cfg).points;
+    const base = groupRanks(p.ranks, p.base_top);
+    if (!base.length && !(p.expand_min_players > 0 && p.expand_top > p.base_top)) return 'ไม่มีอันดับที่ได้แต้ม';
+    let text = `แจกให้ **Top ${p.base_top}**: ${base.map(g => `${rankLabel(g)} **${g.v}** แต้ม`).join(' · ') || '-'}`;
+    if (p.expand_min_players > 0 && p.expand_top > p.base_top) {
+        const extra = groupRanks(p.ranks, p.expand_top).map(g => ({ ...g, from: Math.max(g.from, p.base_top + 1) })).filter(g => g.to > p.base_top);
+        text += `\nถ้ามีผู้เข้าแข่งครบ **${p.expand_min_players} คน** ขยายเป็น **Top ${p.expand_top}**${extra.length ? ` (${extra.map(g => `${rankLabel(g)} **${g.v}** แต้ม`).join(' · ')})` : ''}`;
+    }
+    return text;
+}
+function describeExp(cfg) {
+    const e = normalizeRewards(cfg).exp;
+    const parts = groupRanks(e.ranks).map(g => `${g.from === g.to ? `อันดับ ${g.from}` : `อันดับ ${g.from}-${g.to}`} +${g.v}`);
+    if (e.join) parts.push(`เข้าร่วม +${e.join}`);
+    if (e.full_play) parts.push(`เล่นครบทุกรอบ +${e.full_play}`);
+    return parts.join(' | ') || 'ไม่มี EXP';
 }
 
 // ---------- ตัวช่วยทั่วไป ----------
@@ -259,6 +329,9 @@ function allComplete(matches) {
 function rewardsPreview(tournament, players, matches, playedAllIds = null) {
     const table = standings(tournament, players, matches);
     const total = players.length;
+    const cfg = rewardsOf(tournament);
+    const givePoints = tournament?.give_points !== false;
+    const giveExp = tournament?.give_exp !== false;
     return table.map(r => {
         const played = r.played > 0;
         const playedAll = playedAllIds ? playedAllIds.has(r.player.id) : !!r.player.played_all;
@@ -268,14 +341,15 @@ function rewardsPreview(tournament, players, matches, playedAllIds = null) {
             wins: r.wins, losses: r.losses, played: r.played, byes: r.byes,
             buchholz: r.buchholz, forfeit: r.forfeit,
             playedAll: played ? playedAll : false,
-            points: played ? calcPoints(r.rank, total) : 0,
-            exp: played ? calcExp(r.rank, playedAll) : 0,
+            points: played && givePoints ? calcPoints(r.rank, total, cfg) : 0,
+            exp: played && giveExp ? calcExp(r.rank, playedAll, cfg) : 0,
         };
     });
 }
 
 module.exports = {
-    EXP_JOIN, EXP_FULL_PLAY, placementExp, calcExp, pointsQuota, calcPoints,
+    EXP_JOIN, EXP_FULL_PLAY, DEFAULT_REWARDS, MAX_REWARD_RANKS, normalizeRewards, rewardsOf,
+    placementExp, calcExp, pointsQuota, calcPoints, describePoints, describeExp,
     shuffle, swissRoundsFor, elimRoundsFor, totalRounds, computeStats, standings,
     pairSwissRound, seedOrder, buildElimBracket, nextElimMatch, applyElimAdvance,
     currentRoundOf, isRoundComplete, allComplete, rewardsPreview,

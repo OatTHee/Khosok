@@ -10,13 +10,14 @@ app.listen(process.env.PORT || 3000, '0.0.0.0', () => {
     console.log('เซิร์ฟเวอร์เริ่มทำงานแล้ว (เว็บจัดทัวร์ + บอท)');
 });
 
-const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder, AttachmentBuilder } = require('discord.js');
+const path = require('path');
 const axios = require('axios');
 axios.defaults.timeout = 8000; // ตัดจบถ้านานเกิน 8 วินาที
 const T = require('./tournament/service'); // 🏟️ ระบบทัวร์นาเมนต์ของเราเอง (แทน Challonge)
 const TE = require('./tournament/engine');
 const activePolls = new Map();
-const pendingFinish = new Map(); // เก็บสถานะ "ติ๊กคนเล่นครบทุกรอบ" ก่อนกดยืนยันปิดจ็อบ
+const pendingExp = new Map(); // เก็บสถานะ "ติ๊กคนเล่นครบทุกรอบ" ก่อนกดยืนยันแจก EXP
 const COMPETITOR_ROLE_ID = '1476156740738486457';
 
 // 🛡️ สิทธิ์จัดทัวร์ใน Discord: คนที่มีสิทธิ์ Manage Messages ในเซิร์ฟ หรือสตาฟที่แอดมินแต่งตั้งจากเว็บ
@@ -127,12 +128,32 @@ function getTitleByExp(exp) {
 }
 
 // =========================================================
-// 📐 เกณฑ์ EXP (ตัวจริงอยู่ที่ tournament/engine.js ที่เดียว)
+// 📐 เกณฑ์แต้ม/EXP อยู่ที่ tournament/engine.js (แต่ละงานตั้งเองได้ในเว็บ → tournaments.reward_config)
 // =========================================================
-const EXP_JOIN = TE.EXP_JOIN;
-const EXP_FULL_PLAY = TE.EXP_FULL_PLAY;
-const getPlacementExp = TE.placementExp;
-const calcTournamentExp = TE.calcExp;
+
+// 🖼️ โลโก้กลุ่ม (รูปย่อมุมขวาบนของป้าย) — ใช้ลิงก์จากเว็บของบอทเอง ถ้าไม่รู้ลิงก์ค่อยแนบไฟล์ไปกับข้อความ
+const LOGO_FILE = path.join(__dirname, 'public', 'logo-dmt.png');
+const LOGO_NAME = 'logo-dmt.png';
+const PUBLIC_BASE = String(process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+const LOGO_URL = process.env.LOGO_URL || (PUBLIC_BASE ? `${PUBLIC_BASE}/${LOGO_NAME}` : `attachment://${LOGO_NAME}`);
+const LOGO_IS_FILE = LOGO_URL.startsWith('attachment://');
+// ใส่ใน channel.send / message.edit เวลาใช้แบบแนบไฟล์ (edit ต้องล้างไฟล์เก่าก่อน ไม่งั้นแนบซ้ำ)
+const logoSend = () => (LOGO_IS_FILE ? { files: [new AttachmentBuilder(LOGO_FILE, { name: LOGO_NAME })] } : {});
+const logoEdit = () => (LOGO_IS_FILE ? { files: [new AttachmentBuilder(LOGO_FILE, { name: LOGO_NAME })], attachments: [] } : {});
+
+// 🔑 หน้า login ของเว็บ DMT Promo Shop (ฐานข้อมูลผู้ใช้ร่วมกัน)
+const SHOP_LOGIN_URL = process.env.SHOP_LOGIN_URL || 'https://card-catalog-pi.vercel.app/login';
+const loginButton = () => new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(SHOP_LOGIN_URL).setLabel('Login ด้วย Discord (DMT Promo Shop)').setEmoji('🔑');
+
+// 🏷️ badge บอกว่างานนี้แจกอะไรบ้าง (ตามที่ติ๊กไว้ตอนสร้าง/ตั้งค่างาน)
+function rewardBadges(t) {
+    const b = [
+        t.give_points !== false ? '`💎 แจกแต้มแลกการ์ด`' : '`🚫 ไม่แจกแต้ม`',
+        t.give_exp !== false ? '`✨ แจก EXP`' : '`🚫 ไม่แจก EXP`',
+    ];
+    if (t.other_rewards) b.push('`🎁 มีของรางวัลพิเศษ`');
+    return b.join(' ');
+}
 
 // =========================================================
 // 🗳️ สร้างหน้าจอติ๊ก "ใครเล่นครบทุกรอบ" ก่อนแจก EXP
@@ -160,7 +181,7 @@ function buildFullPlayComponents(code, state) {
 
     rows.push(new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`fullall_${code}`).setLabel('ทุกคนเล่นครบ').setStyle(ButtonStyle.Success).setEmoji('✅'),
-        new ButtonBuilder().setCustomId(`fullconfirm_${code}`).setLabel('ยืนยัน & ปิดจ็อบ').setStyle(ButtonStyle.Danger).setEmoji('🏁'),
+        new ButtonBuilder().setCustomId(`fullconfirm_${code}`).setLabel('ยืนยัน & แจก EXP').setStyle(ButtonStyle.Primary).setEmoji('✨'),
         new ButtonBuilder().setCustomId(`fullcancel_${code}`).setLabel('ยกเลิก').setStyle(ButtonStyle.Secondary).setEmoji('✖️')
     ));
 
@@ -173,7 +194,7 @@ function buildFullPlayText(state) {
 
     state.players.forEach(p => {
         const full = state.full.has(p.id);
-        const exp = calcTournamentExp(p.rank, full);
+        const exp = TE.calcExp(p.rank, full, state.cfg);
         text += `${full ? '☑️' : '⬜'} ${p.rank}. ${p.mention} → **${exp} EXP**${p.linked ? '' : ' *(walk-in ไม่ได้รับ)*'}\n`;
     });
 
@@ -181,7 +202,7 @@ function buildFullPlayText(state) {
         text += `\n🚫 **ไม่ได้ลงแข่งเลย (ไม่ได้ EXP):** ${state.noShow.join(', ')}\n`;
     }
 
-    text += `\n> อันดับ 1 +50 | อันดับ 2-3 +30 | อันดับ 4-5 +20 | เข้าร่วม +10 | เล่นครบทุกรอบ +10`;
+    text += `\n> ${TE.describeExp(state.cfg)}`;
     return text.substring(0, 1900);
 }
 
@@ -191,7 +212,7 @@ function buildFullPlayText(state) {
 const mentionOf = p => (p.discord_id ? `<@${p.discord_id}>` : `**${p.display_name}**`);
 const thTime = iso => new Date(iso).toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit' }).replace(':', '.');
 
-// 1. บอร์ดรับสมัคร (โชว์จำนวนคน + ข้อความเชิญชวน)
+// 1. บอร์ดรับสมัคร (โชว์จำนวนคน + ข้อความเชิญชวน + วิธีแจกแต้ม + กล่อง login)
 function buildSetupEmbed(v) {
     const t = v.tournament;
     const count = v.players.length;
@@ -200,24 +221,63 @@ function buildSetupEmbed(v) {
     if (t.status !== 'registration') {
         return new EmbedBuilder()
             .setTitle(`ปิดรับสมัครแล้ว: ${t.name}`)
-            .setDescription(`👤 ผู้เข้าแข่งขันทั้งหมด **${count}** คน\n${t.status === 'running' ? '⚔️ การแข่งขันเริ่มแล้ว ดูคู่ของคุณในโพสต์ถัดไป' : t.status === 'finished' ? '🏁 งานนี้จบแล้ว' : '❌ งานนี้ถูกยกเลิก'}`)
+            .setDescription(`${rewardBadges(t)}\n\n👤 ผู้เข้าแข่งขันทั้งหมด **${count}** คน\n${t.status === 'running' ? '⚔️ การแข่งขันเริ่มแล้ว ดูคู่ของคุณในโพสต์ถัดไป' : t.status === 'finished' ? '🏁 งานนี้จบแล้ว' : '❌ งานนี้ถูกยกเลิก'}`)
             .setColor(0x808080)
+            .setThumbnail(LOGO_URL)
             .setFooter({ text: `งาน #${t.code}` });
     }
 
     const names = v.players.slice(0, 40).map((p, i) => `${i + 1}. ${p.display_name}`).join('\n');
+    const cfg = v.rewards || TE.rewardsOf(t);
+    let desc = `# ${startTimeText}\n${rewardBadges(t)}\n\n📊 **จำนวนผู้สมัครปัจจุบัน:**\n# 👤 ${count} คน\n\n`;
+    if (t.give_points !== false) {
+        desc += `💎 **การแจกแต้มแลกการ์ด**\n${TE.describePoints(cfg)}\n`;
+        if (cfg.points.expand_min_players > 0 && cfg.points.expand_top > cfg.points.base_top) desc += `🔥 มาร่วมสนุกกันเยอะๆ นะครับ!\n`;
+        desc += '\n';
+    }
+    if (t.other_rewards) desc += `🎁 **ของรางวัลพิเศษ**\n${t.other_rewards}\n\n`;
+    desc += `📝 **ขอความร่วมมือ:** ถ้ากดสมัครแล้ว **เปลี่ยนชื่อเล่นในเซิร์ฟ** ภายหลัง กรุณากด **สละสิทธิ์** แล้วกด **สมัครแข่ง** ใหม่อีกครั้ง ไม่งั้นแอดมินทำงานยากครับ 🙏\n\n`;
+    desc += `กดปุ่มด้านล่างเพื่อสมัคร หรือสละสิทธิ์\n(เฉพาะแอดมินเท่านั้นที่กดปุ่มเริ่มแข่งได้)`;
+    if (names) desc += `\n\n**รายชื่อ**\n${names}`;
+
     return new EmbedBuilder()
         .setTitle(`เปิดรับสมัคร: ${t.name}`)
-        .setDescription(`# ${startTimeText}\n\n📊 **จำนวนผู้สมัครปัจจุบัน:**\n# 👤 ${count} คน\n\n🔥 **เป้าหมายพิเศษ:**\nหากมีผู้เข้าแข่งขันถึง **10 คน** ระบบจะขยายโควต้าแจกรางวัลให้สูงสุดถึง **Top 5!** มาร่วมสนุกกันเยอะๆ นะครับ!\n\nกดปุ่มด้านล่างเพื่อสมัคร หรือสละสิทธิ์\n(เฉพาะแอดมินเท่านั้นที่กดปุ่มเริ่มแข่งได้)${names ? `\n\n**รายชื่อ**\n${names}` : ''}`.substring(0, 4000))
+        .setDescription(desc.substring(0, 4000))
         .setColor(0x00FF00)
+        .setThumbnail(LOGO_URL)
         .setFooter({ text: `งาน #${t.code} • ${t.format === 'single_elim' ? 'แพ้คัดออก' : 'Swiss'}` });
+}
+
+// กล่องประกาศ: ยังไม่เคยลงทะเบียน → login เว็บ DMT Promo Shop ก่อน
+function buildLoginEmbed() {
+    return new EmbedBuilder()
+        .setTitle('🔑 ยังไม่เคยลงทะเบียนกับเรา? Login ก่อนสมัครนะครับ')
+        .setDescription([
+            'ระบบสมัครแข่งใช้บัญชีเดียวกับเว็บ **DMT Promo Shop** (แต้มแลกการ์ด / EXP เข้าบัญชีนี้)',
+            '',
+            '1️⃣ กดปุ่ม **🔑 Login ด้วย Discord** ด้านล่าง',
+            '2️⃣ ที่หน้าเว็บ เลือก **เข้าสู่ระบบด้วย Discord** (ใช้ Discord บัญชีเดียวกับที่อยู่ในเซิร์ฟนี้)',
+            '3️⃣ กลับมากด **สมัครแข่ง** ได้เลย',
+            '',
+            '*เคย login ด้วย Discord แล้ว ไม่ต้องทำซ้ำครับ*',
+        ].join('\n'))
+        .setColor(0x5865F2);
+}
+
+function setupPayload(v) {
+    const open = v.tournament.status === 'registration';
+    return {
+        embeds: open ? [buildSetupEmbed(v), buildLoginEmbed()] : [buildSetupEmbed(v)],
+        components: open ? [setupButtons(v.tournament.code)] : [],
+    };
 }
 
 function setupButtons(code) {
     return new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`register_${code}`).setLabel('สมัครแข่ง').setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId(`leave_${code}`).setLabel('สละสิทธิ์').setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId(`start_${code}`).setLabel('ปิดรับสมัคร & เริ่มแข่ง').setStyle(ButtonStyle.Primary)
+        new ButtonBuilder().setCustomId(`start_${code}`).setLabel('ปิดรับสมัคร & เริ่มแข่ง').setStyle(ButtonStyle.Primary),
+        loginButton()
     );
 }
 
@@ -226,7 +286,7 @@ function buildCurrentEmbed(v) {
     const t = v.tournament;
     const name = Object.fromEntries(v.players.map(p => [p.id, p]));
     const who = id => (name[id] ? name[id].display_name : '*[รอผู้ชนะ]*');
-    let text = '';
+    let text = `${rewardBadges(t)}\n\n`;
 
     if (t.round_ends_at) {
         const unix = Math.floor(new Date(t.round_ends_at).getTime() / 1000);
@@ -268,6 +328,7 @@ function buildCurrentEmbed(v) {
         .setTitle(`🏆 สถานะการจับคู่ปัจจุบัน: ${t.name}`)
         .setDescription(text.substring(0, 4000) || 'ยังไม่มีข้อมูลการประกบคู่ครับ')
         .setColor(0x00FFFF)
+        .setThumbnail(LOGO_URL)
         .setFooter({ text: `งาน #${t.code} • อัปเดตอัตโนมัติเมื่อกรอกผลจากเว็บ` })
         .setTimestamp();
 }
@@ -284,7 +345,8 @@ function currentButtons(v) {
 function buildStandingEmbed(v) {
     const t = v.tournament;
     const done = t.status === 'finished';
-    let text = `ผู้เข้าร่วมทั้งหมด: **${v.players.length}** คน (โควตาแจกแต้ม: **Top ${v.pointsQuota}**)\n`;
+    let text = `${rewardBadges(t)}\n\n`;
+    text += `ผู้เข้าร่วมทั้งหมด: **${v.players.length}** คน${t.give_points !== false ? ` (โควตาแจกแต้ม: **Top ${v.pointsQuota}**)` : ''}\n`;
     text += done ? `**🏁 ทัวร์นาเมนต์นี้จบการแข่งขันแล้ว 🏁**\n\n` : `รอบ ${v.currentRound} / ${v.totalRounds}\n\n`;
 
     v.standings.forEach(s => {
@@ -301,7 +363,47 @@ function buildStandingEmbed(v) {
         .setTitle(done ? `📊 สรุปตารางคะแนน (ปิดจ็อบแล้ว)` : `📊 สรุปตารางคะแนนล่าสุด`)
         .setDescription(text.substring(0, 4000))
         .setColor(done ? 0x00FF00 : 0xFFD700)
+        .setThumbnail(LOGO_URL)
         .setFooter({ text: `${t.name} • งาน #${t.code}` });
+}
+
+// ปุ่มใต้ตารางคะแนน: แจกแต้มให้ Top / แจก EXP / ปิดจ็อบ บันทึกประวัติ (ขึ้นเฉพาะรางวัลที่งานนี้แจก)
+function standingButtons(v) {
+    const t = v.tournament;
+    if (t.status !== 'running' && t.status !== 'finished') return [];
+    const btns = [];
+    if (t.give_points !== false) {
+        btns.push(new ButtonBuilder()
+            .setCustomId(`reward_${t.code}`)
+            .setLabel(t.points_awarded_at ? 'แจกแต้มไปแล้ว' : `แจกแต้มให้ Top ${v.pointsQuota}`)
+            .setStyle(ButtonStyle.Success).setEmoji('💸')
+            .setDisabled(!!t.points_awarded_at));
+    }
+    if (t.give_exp !== false) {
+        btns.push(new ButtonBuilder()
+            .setCustomId(`exp_${t.code}`)
+            .setLabel(v.expAwarded ? 'แจก EXP ไปแล้ว' : 'แจก EXP')
+            .setStyle(ButtonStyle.Primary).setEmoji('✨')
+            .setDisabled(!!v.expAwarded));
+    }
+    btns.push(new ButtonBuilder()
+        .setCustomId(`finish_${t.code}`)
+        .setLabel(t.status === 'finished' ? 'ปิดจ็อบแล้ว' : 'ปิดจ็อบ & บันทึกประวัติ')
+        .setStyle(ButtonStyle.Danger).setEmoji('🏁')
+        .setDisabled(t.status === 'finished'));
+    // จบงานและแจกครบทุกอย่างแล้ว ไม่ต้องโชว์ปุ่ม
+    if (btns.every(b => b.data.disabled)) return [];
+    return [new ActionRowBuilder().addComponents(...btns)];
+}
+
+// อัปเดตข้อความตารางคะแนนที่มีปุ่ม (หลังกดแจก/ปิดจ็อบ)
+async function refreshStandingMessage(ref, idOrCode) {
+    if (!ref?.channelId || !ref?.messageId) return;
+    const channel = await client.channels.fetch(ref.channelId).catch(() => null);
+    const msg = channel && await channel.messages.fetch(ref.messageId).catch(() => null);
+    if (!msg) return;
+    const v = await T.view(idOrCode);
+    await msg.edit({ embeds: [buildStandingEmbed(v)], components: standingButtons(v), ...logoEdit() }).catch(() => {});
 }
 
 // ข้อความ error ที่อ่านรู้เรื่อง (ServiceError เป็นภาษาไทยอยู่แล้ว)
@@ -325,7 +427,7 @@ async function refreshSetupBoard(t) {
     const v = await T.view(t.id);
     const msg = await channel.messages.fetch(t.setup_message_id).catch(() => null);
     if (!msg) return;
-    await msg.edit({ embeds: [buildSetupEmbed(v)], components: v.tournament.status === 'registration' ? [setupButtons(t.code)] : [] }).catch(() => {});
+    await msg.edit({ ...setupPayload(v), ...logoEdit() }).catch(() => {});
 }
 
 async function refreshCurrentBoard(t) {
@@ -334,12 +436,12 @@ async function refreshCurrentBoard(t) {
     const v = await T.view(t.id);
     const msg = await channel.messages.fetch(t.current_message_id).catch(() => null);
     if (!msg) return;
-    await msg.edit({ embeds: [buildCurrentEmbed(v)], components: v.tournament.status === 'running' ? [currentButtons(v)] : [] }).catch(() => {});
+    await msg.edit({ embeds: [buildCurrentEmbed(v)], components: v.tournament.status === 'running' ? [currentButtons(v)] : [], ...logoEdit() }).catch(() => {});
 }
 
 async function postCurrentBoard(channel, idOrCode) {
     const v = await T.view(idOrCode);
-    const msg = await channel.send({ content: `อัปเดตสถานะการแข่งขันล่าสุด 📢`, embeds: [buildCurrentEmbed(v)], components: [currentButtons(v)] });
+    const msg = await channel.send({ content: `อัปเดตสถานะการแข่งขันล่าสุด 📢`, embeds: [buildCurrentEmbed(v)], components: [currentButtons(v)], ...logoSend() });
     await T.setDiscordRefs(v.tournament.id, { discord_channel_id: channel.id, current_message_id: msg.id });
     return msg;
 }
@@ -488,7 +590,7 @@ client.on('messageCreate', async message => {
             if (v.tournament.status !== 'registration') {
                 return message.reply(`⚠️ งาน #${v.tournament.code} ไม่ได้อยู่ในช่วงรับสมัครแล้ว (ใช้ \`!current ${v.tournament.code}\` เพื่อดูคู่)`);
             }
-            const sent = await message.channel.send({ embeds: [buildSetupEmbed(v)], components: [setupButtons(v.tournament.code)] });
+            const sent = await message.channel.send({ ...setupPayload(v), ...logoSend() });
             await T.setDiscordRefs(v.tournament.id, { discord_channel_id: message.channel.id, setup_message_id: sent.id });
             setTimeout(() => message.delete().catch(() => {}), 1000);
         } catch (error) {
@@ -516,23 +618,7 @@ client.on('messageCreate', async message => {
             const t = v.tournament;
             if (!v.matches.length) return message.reply('⚠️ งานนี้ยังไม่เริ่มแข่งครับ');
 
-            const embed = buildStandingEmbed(v);
-            if (t.status === 'running') {
-                const row = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder()
-                        .setCustomId(`reward_${t.code}`)
-                        .setLabel(t.points_awarded_at ? 'แจกแต้มไปแล้ว' : `แจกแต้มให้ Top ${v.pointsQuota}`)
-                        .setStyle(ButtonStyle.Success).setEmoji('💸')
-                        .setDisabled(!!t.points_awarded_at),
-                    new ButtonBuilder()
-                        .setCustomId(`finish_${t.code}`)
-                        .setLabel('ปิดจ็อบ & บันทึกประวัติ')
-                        .setStyle(ButtonStyle.Danger).setEmoji('🏁')
-                );
-                await message.channel.send({ embeds: [embed], components: [row] });
-            } else {
-                await message.channel.send({ embeds: [embed] });
-            }
+            await message.channel.send({ embeds: [buildStandingEmbed(v)], components: standingButtons(v), ...logoSend() });
             setTimeout(() => message.delete().catch(() => {}), 1000);
         } catch (error) {
             await message.channel.send(`❌ ${errText(error)}`).catch(() => {});
@@ -703,7 +789,7 @@ client.on('interactionCreate', async interaction => {
         // =========================
         if (interaction.isStringSelectMenu()) {
 
-            // ✅ ติ๊กคนที่เล่นครบทุกรอบ (ก่อนปิดจ็อบ)
+            // ✅ ติ๊กคนที่เล่นครบทุกรอบ (ก่อนแจก EXP)
             if (interaction.customId.startsWith('fullplay_')) {
                 if (!(await canManageTour(interaction.member))) {
                     return await interaction.reply({ content: '⛔ เฉพาะแอดมินเท่านั้น', ephemeral: true });
@@ -712,10 +798,10 @@ client.on('interactionCreate', async interaction => {
                 const idParts = interaction.customId.split('_');
                 const tid = idParts[1];
                 const chunkIndex = parseInt(idParts[2]);
-                const state = pendingFinish.get(tid);
+                const state = pendingExp.get(tid);
 
                 if (!state) {
-                    return await interaction.reply({ content: '❌ รายการนี้หมดอายุแล้ว กดปุ่ม "ปิดจ็อบ" ใหม่อีกครั้งครับ', ephemeral: true });
+                    return await interaction.reply({ content: '❌ รายการนี้หมดอายุแล้ว กดปุ่ม "แจก EXP" ใหม่อีกครั้งครับ', ephemeral: true });
                 }
 
                 // อัปเดตเฉพาะคนในชุดนี้: เอาออกทั้งชุดก่อน แล้วใส่กลับเฉพาะคนที่ถูกติ๊ก
@@ -825,7 +911,7 @@ client.on('interactionCreate', async interaction => {
         // =========================
         if (action === 'update') {
             const v = await T.view(tournamentId);
-            await interaction.message.edit({ embeds: [buildCurrentEmbed(v)], components: v.tournament.status === 'running' ? [currentButtons(v)] : [] });
+            await interaction.message.edit({ embeds: [buildCurrentEmbed(v)], components: v.tournament.status === 'running' ? [currentButtons(v)] : [], ...logoEdit() });
             return await interaction.editReply('✅ อัปเดตแล้ว');
         }
 
@@ -842,7 +928,10 @@ client.on('interactionCreate', async interaction => {
                 });
                 return await interaction.editReply(`✅ สมัครแข่งสำเร็จในชื่อ **${serverNickname}**!`);
             } catch (error) {
-                if (error.message === 'NO_ACCOUNT') return await interaction.editReply('❌ คุณยังไม่ได้ลงทะเบียนในระบบฐานข้อมูลครับ (สมัคร/ผูก Discord ที่เว็บ DMT Shop ก่อน)');
+                if (error.message === 'NO_ACCOUNT') return await interaction.editReply({
+                    content: '❌ คุณยังไม่ได้ลงทะเบียนกับเราครับ\nกดปุ่มด้านล่างเพื่อ **Login ด้วย Discord** ที่เว็บ DMT Promo Shop (ครั้งเดียว) แล้วกลับมากด **สมัครแข่ง** อีกครั้ง',
+                    components: [new ActionRowBuilder().addComponents(loginButton())],
+                });
                 if (/ข้อมูลซ้ำ/.test(error.message)) return await interaction.editReply('⚠️ คุณสมัครงานนี้ไปแล้วครับ');
                 return await interaction.editReply(`❌ ${errText(error)}`);
             }
@@ -892,31 +981,35 @@ client.on('interactionCreate', async interaction => {
         }
 
         // =========================
-        // 💸 REWARD (ปุ่มแจกแต้ม)
+        // 💸 REWARD (ปุ่มแจกแต้มให้ Top)
         // =========================
         if (action === 'reward') {
             if (!(await canManageTour(interaction.member))) return await interaction.editReply('⛔ เฉพาะแอดมิน');
             try {
                 const res = await T.awardPoints(tournamentId);
-                let text = `✅ แจกแต้มให้ Top ${res.quota} เรียบร้อย! (แชมป์ 10 แต้ม, อันดับอื่น 5 แต้ม — รวมผู้ได้รับ ${res.awarded.length} คน)`;
+                let text = `✅ แจกแต้มให้ Top ${res.quota} เรียบร้อย! รวม **${res.total}** แต้ม — ผู้ได้รับ ${res.awarded.length} คน\n`;
+                text += res.awarded.slice(0, 20).map(a => `• ${a.name} +${a.points} แต้ม`).join('\n');
                 if (res.skipped.length) text += `\n⚠️ ข้าม (ไม่มีบัญชี): ${res.skipped.map(s => s.name).join(', ')}`;
-                return await interaction.editReply(text);
+                await refreshStandingMessage({ channelId: interaction.channelId, messageId: interaction.message?.id }, tournamentId);
+                return await interaction.editReply(text.substring(0, 1900));
             } catch (error) {
                 return await interaction.editReply(`❌ ${errText(error)}`);
             }
         }
 
         // ==========================================
-        // 🏁 FINISH (ปุ่มปิดจ็อบ & บันทึกสถิติ)
+        // ✨ EXP (ปุ่มแจก EXP — คงระบบเช็คคนเล่นครบทุกรอบ)
         // ==========================================
         // ขั้นที่ 1: ขึ้นรายการให้แอดมินติ๊กคนที่เล่นครบทุกรอบก่อน
-        if (action === 'finish') {
-            if (!(await canManageTour(interaction.member))) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
+        if (action === 'exp') {
+            if (!(await canManageTour(interaction.member))) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่แจก EXP ได้');
 
             try {
                 const v = await T.view(tournamentId);
-                if (v.tournament.status === 'finished') return await interaction.editReply('⚠️ งานนี้ปิดจ็อบไปแล้ว');
-                if (!v.canFinish) {
+                const t = v.tournament;
+                if (t.give_exp === false) return await interaction.editReply('⚠️ งานนี้ตั้งค่าไว้ว่าไม่แจก EXP');
+                if (v.expAwarded) return await interaction.editReply('⚠️ งานนี้แจก EXP ไปแล้ว');
+                if (!v.resultsFinal) {
                     return await interaction.editReply(v.allMatchesComplete
                         ? `⚠️ ยังแข่งไม่ครบ ${v.totalRounds} รอบ (ตอนนี้รอบ ${v.currentRound}) — จับคู่รอบถัดไปที่เว็บก่อน`
                         : '⚠️ ยังมีแมตช์ที่ยังไม่กรอกผล กรอกให้ครบที่เว็บจัดทัวร์ก่อนครับ');
@@ -935,15 +1028,17 @@ client.on('interactionCreate', async interaction => {
                 for (let i = 0; i < players.length && chunks.length < 4; i += 25) chunks.push(players.slice(i, i + 25));
 
                 const state = {
-                    tournamentName: v.tournament.name,
+                    tournamentName: t.name,
+                    cfg: v.rewards,
                     players, noShow, chunks,
                     full: new Set(v.standings.filter(s => s.played > 0 && !s.dropped).map(s => s.player_id)),
+                    standingRef: { channelId: interaction.channelId, messageId: interaction.message?.id },
                 };
-                pendingFinish.set(String(v.tournament.code), state);
+                pendingExp.set(String(t.code), state);
 
                 return await interaction.editReply({
                     content: buildFullPlayText(state),
-                    components: buildFullPlayComponents(v.tournament.code, state)
+                    components: buildFullPlayComponents(t.code, state)
                 });
             } catch (error) {
                 return await interaction.editReply(`❌ ${errText(error)}`);
@@ -951,41 +1046,91 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (action === 'fullcancel') {
-            pendingFinish.delete(String(tournamentId));
-            return await interaction.editReply('✖️ ยกเลิกการปิดจ็อบแล้ว ยังไม่มีการแจก EXP ครับ');
+            pendingExp.delete(String(tournamentId));
+            return await interaction.editReply('✖️ ยกเลิกแล้ว ยังไม่มีการแจก EXP ครับ');
         }
 
-        // ขั้นที่ 2: ยืนยันแล้ว → ปิดจ็อบ + แจก EXP (ธุรกรรมเดียวใน Supabase)
+        // ขั้นที่ 2: ยืนยันแล้ว → แจก EXP (ธุรกรรมเดียวใน Supabase)
         if (action === 'fullall' || action === 'fullconfirm') {
-            if (!(await canManageTour(interaction.member))) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
+            if (!(await canManageTour(interaction.member))) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่แจก EXP ได้');
 
-            const state = pendingFinish.get(String(tournamentId));
-            if (!state) return await interaction.editReply('❌ รายการนี้หมดอายุแล้ว กดปุ่ม "ปิดจ็อบ" ใหม่อีกครั้งครับ');
+            const state = pendingExp.get(String(tournamentId));
+            if (!state) return await interaction.editReply('❌ รายการนี้หมดอายุแล้ว กดปุ่ม "แจก EXP" ใหม่อีกครั้งครับ');
 
             const playedAllIds = action === 'fullall' ? state.players.map(p => p.id) : [...state.full];
 
             try {
-                const out = await T.finish(tournamentId, { playedAllIds });
-                pendingFinish.delete(String(tournamentId));
+                const out = await T.awardExp(tournamentId, { playedAllIds });
+                pendingExp.delete(String(tournamentId));
+                const e = out.rewards.exp;
 
-                let summary = `✅ ปิดงานแข่ง **"${state.tournamentName}"** เรียบร้อย!\n📊 แจก EXP ให้ผู้เล่น ${out.awarded.length} คน\n\n`;
+                let summary = `✅ แจก EXP งาน **"${state.tournamentName}"** เรียบร้อย! (${out.awarded.length} คน)\n\n`;
                 out.results
                     .filter(r => r.played > 0)
                     .slice(0, 25)
                     .forEach(r => {
-                        const place = getPlacementExp(r.rank);
-                        const detail = [`เข้าร่วม +${EXP_JOIN}`];
-                        if (place > 0) detail.unshift(`อันดับ ${r.rank} +${place}`);
-                        if (r.playedAll) detail.push(`เล่นครบทุกรอบ +${EXP_FULL_PLAY}`);
+                        const place = e.ranks[r.rank - 1] || 0;
+                        const detail = [];
+                        if (place > 0) detail.push(`อันดับ ${r.rank} +${place}`);
+                        if (e.join) detail.push(`เข้าร่วม +${e.join}`);
+                        if (r.playedAll && e.full_play) detail.push(`เล่นครบทุกรอบ +${e.full_play}`);
                         const who = r.discord_id ? `<@${r.discord_id}>` : `**${r.name}**`;
-                        summary += `${r.playedAll ? '☑️' : '⬜'} ${who} → **${r.exp} EXP** (${detail.join(', ')})\n`;
+                        summary += `${r.playedAll ? '☑️' : '⬜'} ${who} → **${r.exp} EXP**${detail.length ? ` (${detail.join(', ')})` : ''}\n`;
                     });
                 if (out.noShow.length) summary += `\n🚫 ไม่ได้ลงแข่งเลย ไม่ได้ EXP: ${out.noShow.map(n => (n.discord_id ? `<@${n.discord_id}>` : n.name)).join(', ')}`;
                 if (out.skipped.length) summary += `\n⚠️ ไม่พบบัญชี (walk-in/ยังไม่ผูก Discord): ${out.skipped.map(s => s.name).join(', ')}`;
 
+                await refreshStandingMessage(state.standingRef, tournamentId);
                 return await interaction.editReply({ content: summary.substring(0, 1900), components: [] });
             } catch (error) {
                 return await interaction.editReply(`❌ ${errText(error)}`);
+            }
+        }
+
+        // ==========================================
+        // 🏁 FINISH (ปุ่มปิดจ็อบ & บันทึกประวัติ — ไม่แจก EXP)
+        // ==========================================
+        if (action === 'finish') {
+            if (!(await canManageTour(interaction.member))) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
+            try {
+                const v = await T.view(tournamentId);
+                const t = v.tournament;
+                if (t.status === 'finished') return await interaction.editReply('⚠️ งานนี้ปิดจ็อบไปแล้ว');
+                if (!v.canFinish) {
+                    return await interaction.editReply(v.allMatchesComplete
+                        ? `⚠️ ยังแข่งไม่ครบ ${v.totalRounds} รอบ (ตอนนี้รอบ ${v.currentRound}) — จับคู่รอบถัดไปที่เว็บก่อน`
+                        : '⚠️ ยังมีแมตช์ที่ยังไม่กรอกผล กรอกให้ครบที่เว็บจัดทัวร์ก่อนครับ');
+                }
+                const left = [];
+                if (t.give_points !== false && !t.points_awarded_at) left.push('แต้มแลกการ์ด');
+                if (t.give_exp !== false && !v.expAwarded) left.push('EXP');
+                let text = `🏁 **ปิดจ็อบงาน "${t.name}"?**\nจะบันทึกประวัติการแข่งและสถิติผู้เล่น แล้วปิดงาน (ย้อนกลับไม่ได้)\n*ปุ่มนี้ไม่แจก EXP — ใช้ปุ่ม "แจก EXP" แยก*`;
+                if (left.length) text += `\n\n⚠️ ยังไม่ได้แจก **${left.join(' และ ')}** — กดแจกทีหลังได้ แม้ปิดจ็อบแล้ว`;
+                return await interaction.editReply({
+                    content: text,
+                    components: [new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId(`finishok_${t.code}_${interaction.message?.id || ''}`).setLabel('ยืนยันปิดจ็อบ').setStyle(ButtonStyle.Danger).setEmoji('🏁'),
+                        new ButtonBuilder().setCustomId(`finishno_${t.code}`).setLabel('ยกเลิก').setStyle(ButtonStyle.Secondary).setEmoji('✖️')
+                    )],
+                });
+            } catch (error) {
+                return await interaction.editReply(`❌ ${errText(error)}`);
+            }
+        }
+
+        if (action === 'finishno') return await interaction.editReply('✖️ ยกเลิกการปิดจ็อบแล้ว');
+
+        if (action === 'finishok') {
+            if (!(await canManageTour(interaction.member))) return await interaction.editReply('⛔ เฉพาะแอดมินเท่านั้นที่ปิดงานแข่งได้');
+            try {
+                const out = await T.finish(tournamentId);
+                let text = `✅ ปิดจ็อบ บันทึกประวัติเรียบร้อย! (บันทึกสถิติผู้เล่น ${out.recorded.length} คน)`;
+                if (out.skipped.length) text += `\n⚠️ ไม่พบบัญชี ไม่ได้บันทึกสถิติ: ${out.skipped.map(s => s.name).join(', ')}`;
+                if (out.pending.length) text += `\n\n💡 ยังไม่ได้แจก **${out.pending.join(' และ ')}** — กดปุ่มในตารางคะแนนได้เลย`;
+                if (parts[2]) await refreshStandingMessage({ channelId: interaction.channelId, messageId: parts[2] }, tournamentId);
+                return await interaction.editReply({ content: text, components: [] });
+            } catch (error) {
+                return await interaction.editReply({ content: `❌ ${errText(error)}`, components: [] });
             }
         }
 

@@ -10,7 +10,158 @@ const STATUS = {
 };
 const FORMAT = { swiss: 'Swiss', single_elim: 'แพ้คัดออก' };
 const fmtDate = iso => iso ? new Date(iso).toLocaleString('th-TH', { timeZone: 'Asia/Bangkok', dateStyle: 'medium', timeStyle: 'short' }) : '';
-const placementExp = r => (r === 1 ? 50 : r <= 3 ? 30 : r <= 5 ? 20 : 0);
+// ---------- รางวัล: ค่าเริ่มต้น (ตรงกับ tournament/engine.js → DEFAULT_REWARDS) ----------
+const MAX_RANKS = 16;
+const DEFAULT_REWARDS = {
+  points: { ranks: [10, 5, 5, 5, 5], base_top: 3, expand_min_players: 10, expand_top: 5 },
+  exp: { ranks: [50, 30, 30, 20, 20], join: 10, full_play: 10 },
+};
+const clone = o => JSON.parse(JSON.stringify(o));
+const expFor = (cfg, rank, full) => (cfg.exp.ranks[rank - 1] || 0) + cfg.exp.join + (full ? cfg.exp.full_play : 0);
+
+// badge บอกว่างานนี้แจกอะไรบ้าง
+function rewardBadges(t) {
+  const b = [];
+  b.push(t.give_points !== false ? '<span class="badge gold">💎 แจกแต้ม</span>' : '<span class="badge off">แต้ม</span>');
+  b.push(t.give_exp !== false ? '<span class="badge info">✨ แจก EXP</span>' : '<span class="badge off">EXP</span>');
+  if (t.other_rewards) b.push(`<span class="badge warn" title="${esc(t.other_rewards)}">🎁 ของรางวัลอื่น</span>`);
+  return `<span class="badges">${b.join('')}</span>`;
+}
+
+// ข้อความสรุปการแจกแต้ม (ใช้ในตัวอย่างใต้ฟอร์ม)
+function groupRanks(values, upto) {
+  const out = [];
+  for (let r = 1; r <= upto; r++) {
+    const v = values[r - 1] || 0, last = out[out.length - 1];
+    if (last && last.v === v) last.to = r; else out.push({ from: r, to: r, v });
+  }
+  return out.filter(g => g.v > 0);
+}
+const rankLabel = g => (g.from === 1 && g.to === 1 ? 'แชมป์' : g.from === g.to ? `อันดับ ${g.from}` : `อันดับ ${g.from}–${g.to}`);
+function describePointsText(cfg) {
+  const p = cfg.points;
+  let s = `Top ${p.base_top}: ` + (groupRanks(p.ranks, p.base_top).map(g => `${rankLabel(g)} ${g.v} แต้ม`).join(' · ') || '-');
+  if (p.expand_min_players > 0 && p.expand_top > p.base_top) {
+    const extra = groupRanks(p.ranks, p.expand_top).map(g => ({ ...g, from: Math.max(g.from, p.base_top + 1) })).filter(g => g.to > p.base_top);
+    s += `\nครบ ${p.expand_min_players} คน → Top ${p.expand_top}` + (extra.length ? ` (${extra.map(g => `${rankLabel(g)} ${g.v} แต้ม`).join(' · ')})` : '');
+  }
+  return s;
+}
+function describeExpText(cfg) {
+  const e = cfg.exp;
+  const parts = groupRanks(e.ranks, e.ranks.length).map(g => `${g.from === g.to ? `อันดับ ${g.from}` : `อันดับ ${g.from}-${g.to}`} +${g.v}`);
+  if (e.join) parts.push(`เข้าร่วม +${e.join}`);
+  if (e.full_play) parts.push(`เล่นครบทุกรอบ +${e.full_play}`);
+  return parts.join(' · ') || 'ไม่มี EXP';
+}
+
+// ฟอร์มตั้งค่ารางวัล — ใช้ทั้งตอนสร้างงานและแท็บตั้งค่า
+// lock = { points: 'ข้อความ' | null, exp: 'ข้อความ' | null }
+function rewardEditorHTML(t, lock = {}) {
+  const gp = t?.give_points !== false, ge = t?.give_exp !== false, other = t?.other_rewards || '';
+  const dp = lock.points ? 'disabled' : '', de = lock.exp ? 'disabled' : '';
+  return `
+  <div class="rw" id="rw">
+    <div class="rw-block ${gp ? '' : 'off'}" data-block="points">
+      <label class="rw-toggle"><input type="checkbox" name="give_points" ${gp ? 'checked' : ''} ${dp}> 💎 แจกแต้มแลกการ์ด</label>
+      ${lock.points ? `<div class="rw-locked">🔒 ${esc(lock.points)}</div>` : ''}
+      <div class="rw-nums">
+        <label>ได้แต้มกี่อันดับ (ปกติ)<input type="number" min="1" max="${MAX_RANKS}" data-rw="p.base_top" ${dp}></label>
+        <label>ขยายเมื่อครบ (คน)<input type="number" min="0" max="1000" data-rw="p.expand_min_players" ${dp}><span class="hint">0 = ไม่ขยาย</span></label>
+        <label>ขยายถึงอันดับ<input type="number" min="1" max="${MAX_RANKS}" data-rw="p.expand_top" ${dp}></label>
+      </div>
+      <div class="rank-grid" data-grid="points"></div>
+      <div class="rw-preview" data-preview="points"></div>
+    </div>
+    <div class="rw-block ${ge ? '' : 'off'}" data-block="exp">
+      <label class="rw-toggle"><input type="checkbox" name="give_exp" ${ge ? 'checked' : ''} ${de}> ✨ แจก EXP</label>
+      ${lock.exp ? `<div class="rw-locked">🔒 ${esc(lock.exp)}</div>` : ''}
+      <div class="rank-grid" data-grid="exp"></div>
+      <div class="row" style="gap:6px">
+        <button type="button" class="btn ghost sm" data-exp-rows="-1" ${de}>− อันดับ</button>
+        <button type="button" class="btn ghost sm" data-exp-rows="1" ${de}>+ อันดับ</button>
+      </div>
+      <div class="rw-nums">
+        <label>เข้าร่วม (+EXP)<input type="number" min="0" data-rw="e.join" ${de}></label>
+        <label>เล่นครบทุกรอบ (+EXP)<input type="number" min="0" data-rw="e.full_play" ${de}></label>
+      </div>
+      <div class="rw-preview" data-preview="exp"></div>
+    </div>
+    <div class="rw-block ${other ? '' : 'off'}" data-block="other">
+      <label class="rw-toggle"><input type="checkbox" name="give_other" ${other ? 'checked' : ''}> 🎁 มีของรางวัลอื่น <span class="hint">แสดงผลอย่างเดียว แอดมินแจกเอง</span></label>
+      <textarea name="other_rewards" maxlength="500" rows="3" placeholder="เช่น แชมป์ได้ซองการ์ด 1 ซอง / Top 4 ได้สลีฟลายพิเศษ">${esc(other)}</textarea>
+    </div>
+    <div class="row"><button type="button" class="btn ghost sm" data-rw-reset ${lock.points && lock.exp ? 'disabled' : ''}>คืนค่าเกณฑ์มาตรฐาน</button></div>
+  </div>`;
+}
+
+function bindRewardEditor(root, initialCfg, lock = {}) {
+  const cfg = clone(initialCfg || DEFAULT_REWARDS);
+  const num = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) && n >= 0 ? n : d; };
+  const pointRows = () => Math.max(1, cfg.points.base_top, cfg.points.expand_min_players > 0 ? cfg.points.expand_top : 0);
+  const paint = () => {
+    const p = cfg.points, e = cfg.exp;
+    while (p.ranks.length < pointRows()) p.ranks.push(0);
+    p.ranks.length = Math.min(p.ranks.length, pointRows());
+    root.querySelector('[data-rw="p.base_top"]').value = p.base_top;
+    root.querySelector('[data-rw="p.expand_min_players"]').value = p.expand_min_players;
+    root.querySelector('[data-rw="p.expand_top"]').value = p.expand_top;
+    root.querySelector('[data-rw="p.expand_top"]').disabled = !!lock.points || !(p.expand_min_players > 0);
+    root.querySelector('[data-rw="e.join"]').value = e.join;
+    root.querySelector('[data-rw="e.full_play"]').value = e.full_play;
+    root.querySelector('[data-grid="points"]').innerHTML = p.ranks.map((v, i) =>
+      `<label class="${i >= p.base_top ? 'extra' : ''}">อันดับ ${i + 1}${i >= p.base_top ? ' (ขยาย)' : ''}<input type="number" min="0" value="${v}" data-pr="${i}" ${lock.points ? 'disabled' : ''}></label>`).join('');
+    root.querySelector('[data-grid="exp"]').innerHTML = e.ranks.map((v, i) =>
+      `<label>อันดับ ${i + 1}<input type="number" min="0" value="${v}" data-er="${i}" ${lock.exp ? 'disabled' : ''}></label>`).join('');
+    root.querySelector('[data-preview="points"]').textContent = describePointsText(cfg);
+    root.querySelector('[data-preview="exp"]').textContent = describeExpText(cfg);
+  };
+  const previewOnly = () => {
+    root.querySelector('[data-preview="points"]').textContent = describePointsText(cfg);
+    root.querySelector('[data-preview="exp"]').textContent = describeExpText(cfg);
+  };
+  root.addEventListener('input', ev => {
+    const el = ev.target;
+    if (el.dataset.pr !== undefined) { cfg.points.ranks[+el.dataset.pr] = num(el.value, 0); previewOnly(); }
+    else if (el.dataset.er !== undefined) { cfg.exp.ranks[+el.dataset.er] = num(el.value, 0); previewOnly(); }
+    else if (el.dataset.rw === 'e.join') { cfg.exp.join = num(el.value, 0); previewOnly(); }
+    else if (el.dataset.rw === 'e.full_play') { cfg.exp.full_play = num(el.value, 0); previewOnly(); }
+  });
+  root.addEventListener('change', ev => {
+    const el = ev.target, p = cfg.points;
+    if (el.dataset.rw === 'p.base_top') p.base_top = Math.min(MAX_RANKS, Math.max(1, num(el.value, 1)));
+    else if (el.dataset.rw === 'p.expand_min_players') p.expand_min_players = Math.min(1000, num(el.value, 0));
+    else if (el.dataset.rw === 'p.expand_top') p.expand_top = Math.min(MAX_RANKS, num(el.value, p.base_top));
+    else if (el.type === 'checkbox') { el.closest('.rw-block')?.classList.toggle('off', !el.checked); return; }
+    else return;
+    if (p.expand_top < p.base_top) p.expand_top = p.base_top;
+    paint();
+  });
+  root.addEventListener('click', ev => {
+    const b = ev.target.closest('[data-exp-rows],[data-rw-reset]');
+    if (!b) return;
+    if (b.dataset.expRows) {
+      const n = cfg.exp.ranks.length + Number(b.dataset.expRows);
+      if (n >= 1 && n <= MAX_RANKS) { if (n > cfg.exp.ranks.length) cfg.exp.ranks.push(0); else cfg.exp.ranks.pop(); }
+    } else {
+      if (!lock.points) cfg.points = clone(DEFAULT_REWARDS.points);
+      if (!lock.exp) cfg.exp = clone(DEFAULT_REWARDS.exp);
+    }
+    paint();
+  });
+  paint();
+  return {
+    read() {
+      const q = n => root.querySelector(`[name="${n}"]`);
+      return {
+        give_points: q('give_points').checked,
+        give_exp: q('give_exp').checked,
+        other_rewards: q('give_other').checked ? q('other_rewards').value : '',
+        reward_config: clone(cfg),
+      };
+    },
+  };
+}
 
 function toast(msg, isErr = false) {
   const el = $('#toast');
@@ -122,7 +273,7 @@ async function route() {
   if (location.hash.startsWith('#/staff')) { S.code = null; return renderStaff(); }
   const m = location.hash.match(/^#\/t\/([\w-]+)/);
   if (m) {
-    if (S.code !== m[1]) { S.code = m[1]; S.tab = null; S.round = null; S.finishChecks = null; S.lastJson = ''; S.view = null; }
+    if (S.code !== m[1]) { S.code = m[1]; S.tab = null; S.round = null; S.finishChecks = null; S.rwDirty = false; S.lastJson = ''; S.view = null; }
     $('#app').innerHTML = '<div class="loading">กำลังโหลด…</div>';
     await loadDetail(true);
     S.poll = setInterval(() => { if (!document.hidden) loadDetail(false); }, 8000);
@@ -172,7 +323,7 @@ async function renderList() {
       <div class="t-num">#${t.code}</div>
       <div class="t-main">
         <h3>${esc(t.name)}</h3>
-        <div class="row small muted"><span>${FORMAT[t.format]}</span><span>·</span><span>${t.player_count} คน</span>${t.start_at ? `<span class="hide-sm">·</span><span class="hide-sm">${fmtDate(t.start_at)}</span>` : ''}</div>
+        <div class="row small muted"><span>${FORMAT[t.format]}</span><span>·</span><span>${t.player_count} คน</span>${rewardBadges(t)}${t.start_at ? `<span class="hide-sm">·</span><span class="hide-sm">${fmtDate(t.start_at)}</span>` : ''}</div>
       </div>
       <span class="badge ${cls}">${label}</span>
     </a>`;
@@ -201,23 +352,26 @@ function openCreate() {
       <label class="field" style="flex:1">นาทีต่อรอบ<input name="round_minutes" type="number" min="1" max="240" value="40"></label>
     </div>
     <label class="field">เวลาเริ่มงาน (ไม่บังคับ)<input name="start_at" type="datetime-local"></label>
+    <div class="field"><span>รางวัล</span>${rewardEditorHTML(null)}</div>
     <div class="dlg-actions"><button class="btn secondary" value="cancel">ยกเลิก</button><button class="btn" value="ok">สร้างงาน</button></div>
   `, async f => {
     const t = await api('POST', '/tournaments', {
       name: f.get('name'), format: f.get('format'),
       swiss_rounds: f.get('swiss_rounds') || null, round_minutes: Number(f.get('round_minutes') || 40),
       start_at: f.get('start_at') ? new Date(f.get('start_at')).toISOString() : null,
+      ...editor.read(),
     });
     toast(`สร้างงาน #${t.code} แล้ว`);
     location.hash = `#/t/${t.code}`;
   });
+  const editor = bindRewardEditor($('#rw'), DEFAULT_REWARDS);
 }
 
 // ---------- detail ----------
 async function loadDetail(force) {
   if (!S.code) return;
   // ไม่รีเฟรชทับตอนกำลังพิมพ์ หรือเปิดหน้าต่างอยู่
-  if (!force && ($('#dialog').open || ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName))) return;
+  if (!force && (S.rwDirty || $('#dialog').open || ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName))) return;
   let v;
   try { v = await api('GET', `/tournaments/${S.code}`); }
   catch (e) { if (force) $('#app').innerHTML = `<div class="empty">${esc(e.message)}<br><br><a href="#/">← กลับหน้ารวม</a></div>`; return; }
@@ -241,7 +395,7 @@ function renderDetail() {
     ['players', `ผู้เล่น (${v.players.length})`],
     ['matches', t.format === 'single_elim' ? 'สายการแข่ง' : 'จับคู่ & กรอกผล'],
     ['standings', 'ตารางคะแนน'],
-    ['finish', 'แจกรางวัล & ปิดจ็อบ'],
+    ['finish', t.give_points === false && t.give_exp === false ? 'ปิดจ็อบ' : 'แจกรางวัล & ปิดจ็อบ'],
     ['settings', 'ตั้งค่า'],
   ];
   $('#app').innerHTML = `
@@ -252,6 +406,7 @@ function renderDetail() {
         <div class="row small muted" style="margin-top:6px">
           <span class="badge ${cls}">${label}</span>
           <span>${FORMAT[t.format]}</span>
+          ${rewardBadges(t)}
           <span>·</span>
           <span>Discord: <span class="code">!setup ${t.code}</span></span>
         </div>
@@ -261,7 +416,7 @@ function renderDetail() {
     <div class="stats">
       <div class="card stat"><div class="v">${v.players.length}${t.status !== 'registration' && active !== v.players.length ? ` <span class="small muted">(${active} ยังอยู่)</span>` : ''}</div><div class="k">ผู้เข้าแข่งขัน</div></div>
       <div class="card stat"><div class="v">${v.currentRound || '–'} / ${v.totalRounds}</div><div class="k">รอบ</div></div>
-      <div class="card stat"><div class="v">Top ${v.pointsQuota}</div><div class="k">โควตาแจกแต้ม</div></div>
+      ${t.give_points !== false ? `<div class="card stat"><div class="v">Top ${v.pointsQuota}</div><div class="k">โควตาแจกแต้ม</div></div>` : ''}
       ${t.status === 'running' ? `<div class="card stat timer" id="timer"><div class="v" id="timer-v">–</div><div class="k row" style="justify-content:space-between">เวลารอบนี้ <span>${t.round_ends_at
         ? `<button class="btn ghost sm" id="timer-stop">หยุด</button>`
         : `<button class="btn sm" id="timer-go">เริ่ม ${t.round_minutes} นาที</button>`}</span></div></div>` : ''}
@@ -269,7 +424,7 @@ function renderDetail() {
     <nav class="tabs" role="tablist">${tabs.map(([k, l]) => `<button role="tab" data-tab="${k}" class="${S.tab === k ? 'on' : ''}">${l}</button>`).join('')}</nav>
     <section id="tab"></section>`;
 
-  document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; renderDetail(); });
+  document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; S.rwDirty = false; renderDetail(); });
   bindHeadActions(v);
   const timerGo = $('#timer-go'), timerStop = $('#timer-stop');
   if (timerGo) timerGo.onclick = () => act(() => api('POST', `/tournaments/${t.code}/timer`, {}), 'เริ่มจับเวลาแล้ว', timerGo);
@@ -526,73 +681,92 @@ function renderStandings(el, v) {
   const t = v.tournament;
   if (!v.matches.length) { el.innerHTML = '<div class="card empty">ยังไม่มีผลการแข่ง</div>'; return; }
   const medal = r => (r === 1 ? '🥇' : r === 2 ? '🥈' : r === 3 ? '🥉' : r);
+  const gp = t.give_points !== false, ge = t.give_exp !== false;
   el.innerHTML = `
     <div class="card table-wrap">
       <table>
-        <thead><tr><th class="num">อันดับ</th><th>ชื่อ</th><th class="num">ชนะ-แพ้</th>${t.format === 'swiss' ? '<th class="num hide-sm" title="Buchholz: ผลรวมชนะของคู่แข่ง">BH</th>' : ''}<th class="num">แต้ม</th><th class="num">EXP*</th></tr></thead>
+        <thead><tr><th class="num">อันดับ</th><th>ชื่อ</th><th class="num">ชนะ-แพ้</th>${t.format === 'swiss' ? '<th class="num hide-sm" title="Buchholz: ผลรวมชนะของคู่แข่ง">BH</th>' : ''}${gp ? '<th class="num">แต้ม</th>' : ''}${ge ? '<th class="num">EXP*</th>' : ''}</tr></thead>
         <tbody>${v.standings.map(s => `<tr class="${s.forfeit ? 'dim' : ''}">
           <td class="num"><b>${medal(s.rank)}</b></td>
           <td><span class="pname">${esc(s.name)}</span> ${s.forfeit ? '<span class="badge danger">ถอนตัว/ปรับแพ้</span>' : ''} ${s.played === 0 ? '<span class="badge">ยังไม่ได้แข่ง</span>' : ''}</td>
           <td class="num">${s.wins}-${s.losses}${s.byes ? ` <span class="muted small">(บาย ${s.byes})</span>` : ''}</td>
           ${t.format === 'swiss' ? `<td class="num hide-sm">${s.buchholz}</td>` : ''}
-          <td class="num">${s.points || ''}</td>
-          <td class="num">${s.exp || ''}</td>
+          ${gp ? `<td class="num">${s.points || ''}</td>` : ''}
+          ${ge ? `<td class="num">${s.exp || ''}</td>` : ''}
         </tr>`).join('')}</tbody>
       </table>
     </div>
-    <p class="small muted">* EXP ตอนนี้คิดแบบ "เล่นครบทุกรอบ" ตามค่าเริ่มต้น ปรับได้ในแท็บปิดจ็อบ · ถอนตัว/ปรับแพ้อยู่ท้ายตารางเสมอ${t.format === 'swiss' ? ' · อันดับเท่ากันตัดสินด้วย BH (ผลรวมชนะของคู่แข่งที่เคยเจอ)' : ''}</p>`;
+    <p class="small muted">${ge ? '* EXP ตอนนี้คิดแบบ "เล่นครบทุกรอบ" ตามค่าเริ่มต้น ปรับได้ในแท็บแจกรางวัล · ' : ''}ถอนตัว/ปรับแพ้อยู่ท้ายตารางเสมอ${t.format === 'swiss' ? ' · อันดับเท่ากันตัดสินด้วย BH (ผลรวมชนะของคู่แข่งที่เคยเจอ)' : ''}</p>`;
 }
 
-// ---------- finish tab ----------
+// ---------- finish tab: แจกแต้ม / แจก EXP / ปิดจ็อบ (แยก 3 ปุ่ม) ----------
 function renderFinish(el, v) {
   const t = v.tournament;
   if (t.status === 'registration' || t.status === 'cancelled') { el.innerHTML = '<div class="card empty">ยังไม่มีอะไรให้แจก</div>'; return; }
 
-  if (!S.finishChecks) S.finishChecks = new Set(v.standings.filter(s => s.playedAll).map(s => s.player_id));
+  const cfg = v.rewards || DEFAULT_REWARDS;
+  const gp = t.give_points !== false, ge = t.give_exp !== false;
   const finished = t.status === 'finished';
-  const calc = s => {
-    if (!s.played) return 0;
-    const full = finished ? s.playedAll : S.finishChecks.has(s.player_id);
-    return placementExp(s.rank) + 10 + (full ? 10 : 0);
-  };
+  const expDone = !!v.expAwarded;
+  if (!S.finishChecks) S.finishChecks = new Set(v.standings.filter(s => s.playedAll).map(s => s.player_id));
+  const isFull = s => (expDone ? s.playedAll : S.finishChecks.has(s.player_id));
+  const calc = s => (!ge || !s.played ? 0 : expFor(cfg, s.rank, isFull(s)));
   const totalExp = v.standings.reduce((a, s) => a + calc(s), 0);
   const totalPts = v.standings.reduce((a, s) => a + s.points, 0);
   const unlinked = v.standings.filter(s => !s.linked && (s.points || calc(s)));
 
   let status = '';
-  if (finished) status = `<div class="notice green">ปิดจ็อบแล้วเมื่อ ${fmtDate(t.finished_at)} — แจก EXP และบันทึกประวัติเรียบร้อย</div>`;
-  else if (!v.allMatchesComplete) status = `<div class="notice warn">ยังมีแมตช์ที่ยังไม่กรอกผล — ปิดจ็อบได้เมื่อกรอกครบ</div>`;
-  else if (!v.canFinish) status = `<div class="notice warn">แข่งไปแล้ว ${v.currentRound} จาก ${v.totalRounds} รอบ — จับคู่รอบต่อไปก่อน หรือลดจำนวนรอบในแท็บตั้งค่า</div>`;
+  if (!v.allMatchesComplete) status = `<div class="notice warn">ยังมีแมตช์ที่ยังไม่กรอกผล — แจกรางวัล/ปิดจ็อบได้เมื่อกรอกครบ</div>`;
+  else if (!v.resultsFinal) status = `<div class="notice warn">แข่งไปแล้ว ${v.currentRound} จาก ${v.totalRounds} รอบ — จับคู่รอบต่อไปก่อน หรือลดจำนวนรอบในแท็บตั้งค่า</div>`;
+  else if (finished) {
+    const left = [gp && !t.points_awarded_at ? 'แต้มแลกการ์ด' : '', ge && !expDone ? 'EXP' : ''].filter(Boolean);
+    status = `<div class="notice ${left.length ? 'warn' : 'green'}">ปิดจ็อบแล้วเมื่อ ${fmtDate(t.finished_at)}${left.length ? ` — ยังไม่ได้แจก ${left.join(' และ ')} (กดแจกได้ด้านล่าง)` : ' — แจกรางวัลครบแล้ว'}</div>`;
+  }
+  const ready = v.resultsFinal && v.allMatchesComplete;
+
+  const pointsCard = gp ? `
+    <div class="card pad stack">
+      <div class="spread"><h2>💎 แจกแต้มให้ Top</h2>${t.points_awarded_at ? '<span class="badge green">แจกแล้ว</span>' : ''}</div>
+      <div class="muted small" style="white-space:pre-line">${esc(describePointsText(cfg))}\nผู้เข้าแข่ง ${v.players.length} คน → Top ${v.pointsQuota} · รวม ${totalPts} แต้ม</div>
+      ${t.points_awarded_at ? `<div class="small muted">แจกเมื่อ ${fmtDate(t.points_awarded_at)}</div>` : `<button class="btn" id="award" ${ready && totalPts ? '' : 'disabled'}>💸 แจกแต้มตอนนี้</button>`}
+    </div>` : '';
+  const expCard = ge ? `
+    <div class="card pad stack">
+      <div class="spread"><h2>✨ แจก EXP</h2>${expDone ? '<span class="badge green">แจกแล้ว</span>' : ''}</div>
+      <div class="muted small">${esc(describeExpText(cfg))} · รวม ${totalExp} EXP</div>
+      ${expDone ? (t.exp_awarded_at ? `<div class="small muted">แจกเมื่อ ${fmtDate(t.exp_awarded_at)}</div>` : '<div class="small muted">แจกไปพร้อมการปิดจ็อบ (ระบบเดิม)</div>')
+        : `<button class="btn" id="award-exp" ${ready ? '' : 'disabled'}>✨ แจก EXP ตามที่ติ๊ก</button>`}
+    </div>` : '';
+  const otherCard = t.other_rewards ? `
+    <div class="card pad stack">
+      <div class="spread"><h2>🎁 ของรางวัลอื่น</h2><span class="badge">แอดมินแจกเอง</span></div>
+      <div class="small" style="white-space:pre-line">${esc(t.other_rewards)}</div>
+    </div>` : '';
+  const closeCard = `
+    <div class="card pad stack">
+      <div class="spread"><h2>🏁 ปิดจ็อบ บันทึกประวัติ</h2>${finished ? '<span class="badge green">ปิดแล้ว</span>' : ''}</div>
+      <div class="muted small">จบงาน บันทึกประวัติการแข่งและสถิติผู้เล่น (ไม่แจก EXP — ใช้ปุ่มแจก EXP แยก)</div>
+      ${finished ? '' : `<button class="btn warn" id="finish" ${v.canFinish ? '' : 'disabled'}>🏁 ปิดจ็อบ & บันทึกประวัติ</button>`}
+    </div>`;
 
   el.innerHTML = `
     <div class="stack">
       ${status}
-      <div class="grid">
-        <div class="card pad stack">
-          <div class="spread"><h2>💎 แต้มแลกการ์ด</h2>${t.points_awarded_at ? '<span class="badge green">แจกแล้ว</span>' : ''}</div>
-          <div class="muted small">แชมป์ 10 แต้ม · อันดับ 2–${v.pointsQuota} คนละ 5 แต้ม (ผู้เข้าแข่ง ${v.players.length} คน → Top ${v.pointsQuota}) · รวม ${totalPts} แต้ม</div>
-          ${t.points_awarded_at ? `<div class="small muted">แจกเมื่อ ${fmtDate(t.points_awarded_at)}</div>` : `<button class="btn" id="award" ${totalPts ? '' : 'disabled'}>แจกแต้มตอนนี้</button>`}
-        </div>
-        <div class="card pad stack">
-          <div class="spread"><h2>✨ EXP & ปิดจ็อบ</h2>${finished ? '<span class="badge green">ปิดแล้ว</span>' : ''}</div>
-          <div class="muted small">อันดับ 1 +50 · 2–3 +30 · 4–5 +20 · เข้าร่วม +10 · เล่นครบทุกรอบ +10 · รวม ${totalExp} EXP</div>
-          ${finished ? '' : `<button class="btn warn" id="finish" ${v.canFinish ? '' : 'disabled'}>🏁 ยืนยันอันดับ & ปิดจ็อบ</button>`}
-        </div>
-      </div>
+      <div class="grid">${pointsCard}${expCard}${otherCard}${closeCard}</div>
       ${unlinked.length ? `<div class="notice warn">walk-in ${unlinked.length} คนไม่มีบัญชี จะไม่ได้แต้ม/EXP: ${unlinked.map(s => esc(s.name)).join(', ')}</div>` : ''}
       <div class="card table-wrap">
         <table>
-          <thead><tr><th class="num">อันดับ</th><th>ชื่อ</th><th style="text-align:center">เล่นครบทุกรอบ</th><th class="num">แต้ม</th><th class="num">EXP</th></tr></thead>
+          <thead><tr><th class="num">อันดับ</th><th>ชื่อ</th>${ge ? '<th style="text-align:center">เล่นครบทุกรอบ</th>' : ''}${gp ? '<th class="num">แต้ม</th>' : ''}${ge ? '<th class="num">EXP</th>' : ''}</tr></thead>
           <tbody>${v.standings.map(s => `<tr class="${s.played ? '' : 'dim'}">
             <td class="num"><b>${s.rank}</b></td>
             <td><span class="pname">${esc(s.name)}</span> ${s.played ? '' : '<span class="badge">ไม่ได้ลงแข่ง</span>'} ${s.forfeit ? '<span class="badge danger">ถอนตัว</span>' : ''}</td>
-            <td style="text-align:center">${s.played ? `<input type="checkbox" data-full="${s.player_id}" ${(finished ? s.playedAll : S.finishChecks.has(s.player_id)) ? 'checked' : ''} ${finished ? 'disabled' : ''} aria-label="เล่นครบทุกรอบ">` : '–'}</td>
-            <td class="num">${s.points || ''}</td>
-            <td class="num"><b>${calc(s) || ''}</b></td>
+            ${ge ? `<td style="text-align:center">${s.played ? `<input type="checkbox" data-full="${s.player_id}" ${isFull(s) ? 'checked' : ''} ${expDone ? 'disabled' : ''} aria-label="เล่นครบทุกรอบ">` : '–'}</td>` : ''}
+            ${gp ? `<td class="num">${s.points || ''}</td>` : ''}
+            ${ge ? `<td class="num"><b>${calc(s) || ''}</b></td>` : ''}
           </tr>`).join('')}</tbody>
         </table>
       </div>
-      ${finished ? '' : '<p class="small muted">ค่าเริ่มต้นติ๊กทุกคนที่ไม่ได้ถอนตัว — เอาติ๊กออกเฉพาะคนที่กลับก่อน</p>'}
+      ${ge && !expDone ? '<p class="small muted">ค่าเริ่มต้นติ๊กทุกคนที่ไม่ได้ถอนตัว — เอาติ๊กออกเฉพาะคนที่กลับก่อน</p>' : ''}
     </div>`;
 
   el.querySelectorAll('[data-full]').forEach(cb => cb.onchange = () => {
@@ -605,12 +779,19 @@ function renderFinish(el, v) {
     if (!await confirmBox('แจกแต้มแลกการ์ด?', `${list}<br><br>แจกได้ครั้งเดียวต่องาน`, 'แจกแต้ม')) return;
     act(() => api('POST', `/tournaments/${t.code}/award-points`), out => `แจกแต้มแล้ว ${out.awarded.length} คน${out.skipped.length ? ` (ข้าม ${out.skipped.length} คนที่ไม่มีบัญชี)` : ''}`, award);
   };
+  const awardExp = $('#award-exp');
+  if (awardExp) awardExp.onclick = async () => {
+    const list = v.standings.filter(s => calc(s)).map(s => `${isFull(s) ? '☑️' : '⬜'} ${s.rank}. ${esc(s.name)} → <b>${calc(s)}</b> EXP`).join('<br>');
+    if (!await confirmBox('แจก EXP?', `${list}<br><br>แจกได้ครั้งเดียวต่องาน`, 'แจก EXP')) return;
+    act(() => api('POST', `/tournaments/${t.code}/award-exp`, { playedAllIds: [...S.finishChecks] }),
+      out => `แจก EXP แล้ว ${out.awarded.length} คน${out.skipped.length ? ` · ข้าม ${out.skipped.length} คน` : ''}`, awardExp);
+  };
   const fin = $('#finish');
   if (fin) fin.onclick = async () => {
-    const extra = t.points_awarded_at ? '' : '<br><b>⚠️ ยังไม่ได้แจกแต้มแลกการ์ด</b> — แจกทีหลังได้';
-    if (!await confirmBox('ปิดจ็อบงานนี้?', `แจก EXP รวม ${totalExp} EXP บันทึกประวัติและสถิติ แล้วปิดงาน<br>ทำแล้วย้อนกลับไม่ได้${extra}`, 'ปิดจ็อบ', true)) return;
-    act(() => api('POST', `/tournaments/${t.code}/finish`, { playedAllIds: [...S.finishChecks] }),
-      out => `ปิดจ็อบแล้ว แจก EXP ${out.awarded.length} คน${out.skipped.length ? ` · ข้าม ${out.skipped.length} คน` : ''}`, fin);
+    const left = [gp && !t.points_awarded_at ? 'แต้มแลกการ์ด' : '', ge && !expDone ? 'EXP' : ''].filter(Boolean);
+    const extra = left.length ? `<br><b>⚠️ ยังไม่ได้แจก ${left.join(' และ ')}</b> — กดแจกทีหลังได้` : '';
+    if (!await confirmBox('ปิดจ็อบงานนี้?', `บันทึกประวัติการแข่งและสถิติผู้เล่น แล้วปิดงาน<br>ทำแล้วย้อนกลับไม่ได้${extra}`, 'ปิดจ็อบ', true)) return;
+    act(() => api('POST', `/tournaments/${t.code}/finish`), 'ปิดจ็อบและบันทึกประวัติแล้ว', fin);
   };
 }
 
@@ -662,6 +843,10 @@ async function renderStaff() {
 function renderSettings(el, v) {
   const t = v.tournament;
   const locked = t.status === 'finished' || t.status === 'cancelled';
+  const rwLock = {
+    points: t.points_awarded_at ? 'แจกแต้มไปแล้ว แก้ส่วนนี้ไม่ได้' : null,
+    exp: v.expAwarded ? 'แจก EXP ไปแล้ว แก้ส่วนนี้ไม่ได้' : null,
+  };
   const local = iso => { if (!iso) return ''; const d = new Date(iso); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
   el.innerHTML = `
     <div class="grid">
@@ -673,6 +858,12 @@ function renderSettings(el, v) {
         <label class="field">เวลาเริ่มงาน<input name="start_at" type="datetime-local" value="${local(t.start_at)}" ${locked ? 'disabled' : ''}></label>
         ${locked ? '' : '<button class="btn">บันทึก</button>'}
       </form>
+      ${t.status === 'cancelled' ? '' : `<form class="card pad stack" id="rw-form">
+        <h2>รางวัล</h2>
+        <div class="small muted">ติ๊กเฉพาะสิ่งที่งานนี้แจก — ปุ่มแจกใน !standing และหน้าเว็บจะขึ้นตามนี้</div>
+        ${rewardEditorHTML(t, rwLock)}
+        <button class="btn">บันทึกรางวัล</button>
+      </form>`}
       <div class="card pad stack">
         <h2>Discord</h2>
         <div class="small">พิมพ์ในห้องแข่งเพื่อเปิดบอร์ดรับสมัคร:<br><span class="code">!setup ${t.code}</span></div>
@@ -682,6 +873,21 @@ function renderSettings(el, v) {
       </div>
       ${locked ? '' : `<div class="card pad stack"><h2>ยกเลิกงาน</h2><div class="small muted">ไม่แจกรางวัลใดๆ และปิดงานนี้</div><button class="btn danger" id="cancel-t">ยกเลิกงานแข่ง</button></div>`}
     </div>`;
+  const rwf = $('#rw-form');
+  if (rwf) {
+    S.rwDirty = false;
+    rwf.addEventListener('input', () => { S.rwDirty = true; });
+    rwf.addEventListener('change', () => { S.rwDirty = true; });
+    const editor = bindRewardEditor($('#rw', rwf), v.rewards, rwLock);
+    rwf.onsubmit = ev => {
+      ev.preventDefault();
+      const body = editor.read();
+      if (rwLock.points) delete body.give_points;
+      if (rwLock.exp) delete body.give_exp;
+      S.rwDirty = false;
+      act(() => api('PATCH', `/tournaments/${t.code}`, body), 'บันทึกรางวัลแล้ว', rwf.querySelector('button:not([type=button])'));
+    };
+  }
   const f = $('#settings');
   f.onsubmit = ev => {
     ev.preventDefault();

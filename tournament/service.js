@@ -58,6 +58,11 @@ async function getFull(idOrCode) {
     return { tournament, players, matches };
 }
 
+// งานที่ปิดจ็อบด้วยระบบเดิม (t_finish) แจก EXP ไปพร้อมกับตอนปิดแล้ว
+function expAwarded(t) {
+    return !!t.exp_awarded_at || (t.status === 'finished' && !t.closed_v2);
+}
+
 function buildView({ tournament, players, matches }) {
     const total = E.totalRounds(tournament, players.length);
     const current = tournament.format === 'single_elim'
@@ -74,7 +79,13 @@ function buildView({ tournament, players, matches }) {
         canNextRound: running && tournament.format === 'swiss' && roundComplete && current < total,
         canFinish: running && everything && (tournament.format === 'single_elim' || current >= total),
         allMatchesComplete: everything,
-        pointsQuota: E.pointsQuota(players.length),
+        // ผลนิ่งแล้ว (กรอกครบ + แข่งครบรอบ หรือปิดจ็อบแล้ว) → กดแจกแต้ม/EXP ได้
+        resultsFinal: tournament.status === 'finished' || (running && everything && (tournament.format === 'single_elim' || current >= total)),
+        rewards: E.rewardsOf(tournament),
+        pointsText: E.describePoints(tournament.reward_config),
+        expText: E.describeExp(tournament.reward_config),
+        expAwarded: expAwarded(tournament),
+        pointsQuota: E.pointsQuota(players.length, tournament.reward_config),
         standings: E.rewardsPreview(tournament, players, matches).map(r => ({
             player_id: r.player.id, name: r.player.display_name, discord_id: r.player.discord_id,
             linked: !!(r.player.customer_id || r.player.discord_id),
@@ -99,6 +110,30 @@ async function listTournaments({ limit = 50 } = {}) {
 // ---------------------------------------------------------
 // สร้าง / แก้ไขงาน
 // ---------------------------------------------------------
+// ตรวจตารางรางวัลจากหน้าเว็บ (ผิดให้แจ้ง ไม่เดาเอง)
+function validateRewards(cfg) {
+    if (cfg === null) return null;
+    if (typeof cfg !== 'object') throw new ServiceError('ตารางรางวัลไม่ถูกต้อง');
+    const isInt = (v, max = 100000) => Number.isInteger(Number(v)) && Number(v) >= 0 && Number(v) <= max && v !== '' && v !== null;
+    const checkRanks = (arr, label) => {
+        if (!Array.isArray(arr) || !arr.length || arr.length > E.MAX_REWARD_RANKS) throw new ServiceError(`${label}: ต้องมี 1–${E.MAX_REWARD_RANKS} อันดับ`);
+        arr.forEach((v, i) => { if (!isInt(v)) throw new ServiceError(`${label}: อันดับ ${i + 1} ต้องเป็นเลขจำนวนเต็ม 0 ขึ้นไป`); });
+    };
+    const p = cfg.points || {}, e = cfg.exp || {};
+    checkRanks(p.ranks, 'แต้มแลกการ์ด');
+    checkRanks(e.ranks, 'EXP');
+    if (!isInt(p.base_top, E.MAX_REWARD_RANKS) || Number(p.base_top) < 1) throw new ServiceError(`จำนวนอันดับที่ได้แต้มต้องเป็น 1–${E.MAX_REWARD_RANKS}`);
+    if (!isInt(p.expand_min_players, 1000)) throw new ServiceError('จำนวนคนที่ต้องครบเพื่อขยายโควตา ต้องเป็น 0 ขึ้นไป (0 = ไม่ขยาย)');
+    if (Number(p.expand_min_players) > 0 && (!isInt(p.expand_top, E.MAX_REWARD_RANKS) || Number(p.expand_top) < Number(p.base_top))) {
+        throw new ServiceError('อันดับที่ขยายถึง ต้องไม่น้อยกว่าจำนวนอันดับปกติ');
+    }
+    if (!isInt(e.join) || !isInt(e.full_play)) throw new ServiceError('EXP เข้าร่วม / เล่นครบ ต้องเป็นเลข 0 ขึ้นไป');
+    const n = E.normalizeRewards(cfg);
+    const need = Math.max(n.points.base_top, n.points.expand_min_players > 0 ? n.points.expand_top : 0);
+    while (n.points.ranks.length < need) n.points.ranks.push(0);
+    return n;
+}
+
 function normalizeSettings(input, { partial = false } = {}) {
     const out = {};
     if (!partial || input.name !== undefined) {
@@ -121,6 +156,13 @@ function normalizeSettings(input, { partial = false } = {}) {
     if (input.start_at !== undefined) {
         out.start_at = input.start_at ? new Date(input.start_at).toISOString() : null;
     }
+    if (input.give_points !== undefined) out.give_points = !!input.give_points;
+    if (input.give_exp !== undefined) out.give_exp = !!input.give_exp;
+    if (input.other_rewards !== undefined) {
+        const txt = String(input.other_rewards ?? '').replace(/\r/g, '').trim().slice(0, 500);
+        out.other_rewards = txt || null;
+    }
+    if (input.reward_config !== undefined) out.reward_config = validateRewards(input.reward_config);
     return out;
 }
 
@@ -132,10 +174,26 @@ async function createTournament(input, userId = null) {
     return t;
 }
 
+const REWARD_KEYS = ['give_points', 'give_exp', 'other_rewards', 'reward_config'];
+
 async function updateTournament(idOrCode, input) {
     const t = await getTournament(idOrCode);
-    if (t.status === 'finished' || t.status === 'cancelled') throw new ServiceError('งานนี้ปิดไปแล้ว แก้ไขไม่ได้');
-    const patch = normalizeSettings(input, { partial: true });
+    if (t.status === 'cancelled') throw new ServiceError('งานนี้ถูกยกเลิกแล้ว แก้ไขไม่ได้');
+    let patch = normalizeSettings(input, { partial: true });
+    // ปิดจ็อบแล้ว: แก้ได้เฉพาะตั้งค่ารางวัลที่ยังไม่ได้แจก
+    if (t.status === 'finished') patch = Object.fromEntries(Object.entries(patch).filter(([k]) => REWARD_KEYS.includes(k)));
+    // แจกไปแล้ว ห้ามเปลี่ยนส่วนนั้น
+    const oldCfg = E.rewardsOf(t);
+    // แจกไปแล้ว: คงค่าเดิมของส่วนนั้นไว้ (ไม่ให้ตัวเลขที่แสดงเพี้ยนจากที่แจกจริง)
+    if (t.points_awarded_at) {
+        if (patch.give_points === false) throw new ServiceError('แจกแต้มไปแล้ว ปิดการแจกแต้มไม่ได้');
+        if (patch.reward_config) patch.reward_config.points = oldCfg.points;
+    }
+    if (expAwarded(t)) {
+        if (patch.give_exp === false && t.exp_awarded_at) throw new ServiceError('แจก EXP ไปแล้ว ปิดการแจก EXP ไม่ได้');
+        if (patch.reward_config) patch.reward_config.exp = oldCfg.exp;
+    }
+    if (!Object.keys(patch).length) throw new ServiceError('ไม่มีอะไรให้บันทึก');
     if (t.status !== 'registration') {
         delete patch.format; // เริ่มแข่งแล้วห้ามเปลี่ยนรูปแบบ
         if (patch.swiss_rounds !== undefined && patch.swiss_rounds !== null && patch.swiss_rounds < t.current_round) {
@@ -416,18 +474,52 @@ async function stopTimer(idOrCode) {
 }
 
 // ---------------------------------------------------------
-// แจกแต้ม / ปิดจ็อบ
+// แจกแต้ม / แจก EXP / ปิดจ็อบ — 3 ปุ่มแยกกัน
+// แจกแต้ม/EXP กดได้อย่างละครั้ง ก่อนหรือหลังปิดจ็อบก็ได้ (ต้องกรอกผลครบทุกแมตช์)
 // ---------------------------------------------------------
+function assertResultsFinal(v) {
+    const t = v.tournament;
+    if (t.status === 'registration') throw new ServiceError('งานนี้ยังไม่เริ่มแข่ง');
+    if (t.status === 'cancelled') throw new ServiceError('งานนี้ถูกยกเลิกแล้ว');
+    if (!v.allMatchesComplete) throw new ServiceError('ยังมีแมตช์ที่ยังไม่กรอกผล');
+    if (!v.resultsFinal) throw new ServiceError(`ยังแข่งไม่ครบ ${v.totalRounds} รอบ`);
+}
+
 async function awardPoints(idOrCode) {
     const full = await getFull(idOrCode);
+    const v = buildView(full);
     const t = full.tournament;
+    if (t.give_points === false) throw new ServiceError('งานนี้ตั้งค่าไว้ว่าไม่แจกแต้มแลกการ์ด');
     if (t.points_awarded_at) throw new ServiceError('งานนี้แจกแต้มไปแล้ว');
+    assertResultsFinal(v);
     const pv = E.rewardsPreview(t, full.players, full.matches);
     const awards = pv.filter(r => r.points > 0).map(r => ({ player_id: r.player.id, rank: r.rank, points: r.points }));
     if (!awards.length) throw new ServiceError('ยังไม่มีผู้เล่นที่ได้แต้ม (ต้องแข่งจริงอย่างน้อย 1 แมตช์)');
     const res = await run(db().rpc('t_award_points', { p_tournament_id: t.id, p_awards: awards }));
     events.emit('points', t, res);
-    return { ...res, quota: E.pointsQuota(full.players.length) };
+    return { ...res, quota: v.pointsQuota, total: awards.reduce((a, x) => a + x.points, 0) };
+}
+
+// playedAllIds: array ของ player id ที่เล่นครบทุกรอบ (ไม่ส่ง = ใช้ค่าในฐานข้อมูล)
+async function awardExp(idOrCode, { playedAllIds } = {}) {
+    const full = await getFull(idOrCode);
+    const v = buildView(full);
+    const t = full.tournament;
+    if (t.give_exp === false) throw new ServiceError('งานนี้ตั้งค่าไว้ว่าไม่แจก EXP');
+    if (expAwarded(t)) throw new ServiceError('งานนี้แจก EXP ไปแล้ว');
+    assertResultsFinal(v);
+
+    const set = Array.isArray(playedAllIds) ? new Set(playedAllIds) : null;
+    const pv = E.rewardsPreview(t, full.players, full.matches, set);
+    const results = pv.map(r => ({ player_id: r.player.id, rank: r.rank, exp: r.exp, played_all: r.playedAll, played: r.played > 0 }));
+    const res = await run(db().rpc('t_award_exp', { p_tournament_id: t.id, p_results: results }));
+    const noShow = pv.filter(r => r.played === 0).map(r => ({ player_id: r.player.id, name: r.player.display_name, discord_id: r.player.discord_id }));
+    const out = {
+        ...res, noShow, rewards: E.rewardsOf(t),
+        results: pv.map(r => ({ player_id: r.player.id, name: r.player.display_name, discord_id: r.player.discord_id, rank: r.rank, exp: r.exp, playedAll: r.playedAll, played: r.played })),
+    };
+    events.emit('exp', t, out);
+    return out;
 }
 
 function buildHistoryText(full, preview) {
@@ -444,8 +536,8 @@ function buildHistoryText(full, preview) {
     return { participants, history };
 }
 
-// playedAllIds: array ของ player id ที่เล่นครบทุกรอบ (ไม่ส่ง = ใช้ค่าในฐานข้อมูล)
-async function finish(idOrCode, { playedAllIds } = {}) {
+// ปิดจ็อบ: บันทึกประวัติการแข่ง + สถิติผู้เล่น แล้วปิดงาน (ไม่แจก EXP)
+async function finish(idOrCode) {
     const full = await getFull(idOrCode);
     const v = buildView(full);
     const t = full.tournament;
@@ -453,17 +545,18 @@ async function finish(idOrCode, { playedAllIds } = {}) {
     if (!v.allMatchesComplete) throw new ServiceError('ยังมีแมตช์ที่ยังไม่กรอกผล');
     if (!v.canFinish) throw new ServiceError(`ยังแข่งไม่ครบ ${v.totalRounds} รอบ`);
 
-    const set = Array.isArray(playedAllIds) ? new Set(playedAllIds) : null;
-    const pv = E.rewardsPreview(t, full.players, full.matches, set);
-    const results = pv.map(r => ({ player_id: r.player.id, rank: r.rank, exp: r.exp, played_all: r.playedAll, played: r.played > 0 }));
+    const pv = E.rewardsPreview(t, full.players, full.matches);
+    const results = pv.map(r => ({ player_id: r.player.id, rank: r.rank, played: r.played > 0 }));
     const { participants, history } = buildHistoryText(full, pv);
 
-    const res = await run(db().rpc('t_finish', {
+    const res = await run(db().rpc('t_close', {
         p_tournament_id: t.id, p_results: results,
         p_participants_list: participants, p_match_history: history,
     }));
-    const noShow = pv.filter(r => r.played === 0).map(r => ({ player_id: r.player.id, name: r.player.display_name, discord_id: r.player.discord_id }));
-    const out = { ...res, results: pv.map(r => ({ player_id: r.player.id, name: r.player.display_name, discord_id: r.player.discord_id, rank: r.rank, exp: r.exp, playedAll: r.playedAll, played: r.played })), noShow };
+    const pending = [];
+    if (t.give_points !== false && !t.points_awarded_at) pending.push('แต้มแลกการ์ด');
+    if (t.give_exp !== false && !expAwarded(t)) pending.push('EXP');
+    const out = { ...res, pending };
     events.emit('finished', { ...t, status: 'finished' }, out);
     return out;
 }
@@ -545,5 +638,5 @@ module.exports = {
     createTournament, updateTournament, cancelTournament, setDiscordRefs,
     findAccountByDiscord, searchAccounts, addPlayer, removePlayer, removePlayerByDiscord, setDropped, renamePlayer,
     startTournament, nextRound, reportResult, clearResult, startTimer, stopTimer,
-    awardPoints, finish,
+    awardPoints, awardExp, finish, expAwarded,
 };
