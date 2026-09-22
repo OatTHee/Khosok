@@ -1104,7 +1104,7 @@ client.on('interactionCreate', async interaction => {
                 const left = [];
                 if (t.give_points !== false && !t.points_awarded_at) left.push('แต้มแลกการ์ด');
                 if (t.give_exp !== false && !v.expAwarded) left.push('EXP');
-                let text = `🏁 **ปิดจ็อบงาน "${t.name}"?**\nจะบันทึกประวัติการแข่งและสถิติผู้เล่น แล้วปิดงาน (ย้อนกลับไม่ได้)\n*ปุ่มนี้ไม่แจก EXP — ใช้ปุ่ม "แจก EXP" แยก*`;
+                let text = `🏁 **ปิดจ็อบงาน "${t.name}"?**\nจะบันทึกประวัติการแข่งและสถิติผู้เล่น แล้วปิดงาน (ถ้าคีย์ผิด กด "เปิดงานใหม่" ในเว็บจัดทัวร์เพื่อกลับมาแก้ได้)\n*ปุ่มนี้ไม่แจก EXP — ใช้ปุ่ม "แจก EXP" แยก*`;
                 if (left.length) text += `\n\n⚠️ ยังไม่ได้แจก **${left.join(' และ ')}** — กดแจกทีหลังได้ แม้ปิดจ็อบแล้ว`;
                 return await interaction.editReply({
                     content: text,

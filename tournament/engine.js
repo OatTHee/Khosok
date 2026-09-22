@@ -306,6 +306,70 @@ function applyElimAdvance(matches, m) {
     return next;
 }
 
+// ---------- แพ้คัดออก: แก้ผลย้อนหลัง ----------
+// แมตช์ถัดๆ ไปในสายของ m ที่กรอกผลไปแล้ว (ไม่นับบาย)
+function elimPlayedDownstream(matches, m) {
+    const out = [];
+    let cur = nextElimMatch(matches, m);
+    while (cur) {
+        if (cur.status === 'complete' && !cur.is_bye) out.push(cur);
+        cur = nextElimMatch(matches, cur);
+    }
+    return out;
+}
+
+const clearMatchResult = x => Object.assign(x, {
+    winner_id: null, score1: null, score2: null, forfeit_player_id: null, completed_at: null,
+});
+const statusByPlayers = x => (x.player1_id && x.player2_id ? 'open' : 'pending');
+
+// เรียกหลังแก้ target แล้ว (target = ผลใหม่ / ล้างผลแล้ว) — oldWinnerId = ผู้ชนะเดิมก่อนแก้
+// mode: 'swap'    = คนชนะจริงเป็นคนที่ไปแข่งรอบถัดไป → แทนชื่อในรอบหลังโดยไม่แตะผล
+//       'cascade' = ล้างผลทุกแมตช์ในสายที่ต่อจากแมตช์นี้
+// คืนรายการแมตช์ที่ถูกแก้ · ถ้ารอบหลังมีผลแล้วแต่ไม่ได้ระบุ mode จะโยน error (code = 'NEEDS_MODE')
+function applyElimCorrection(matches, target, oldWinnerId, mode = null) {
+    const newWinner = target.status === 'complete' ? target.winner_id : null;
+    if (oldWinnerId && oldWinnerId === newWinner) return []; // แก้แค่สกอร์ ผู้ชนะเดิม
+    const next = nextElimMatch(matches, target);
+    if (!next) return [];
+    const played = elimPlayedDownstream(matches, target);
+    if (!played.length) return [applyElimAdvance(matches, target)];
+
+    if (mode === 'swap') {
+        if (!newWinner || !oldWinnerId) {
+            throw Object.assign(new Error('สลับชื่อได้เฉพาะตอนเปลี่ยนตัวผู้ชนะ — ถ้าจะล้างผลให้เลือก "ล้างสาย"'), { code: 'BAD_MODE' });
+        }
+        const changed = [];
+        for (const x of matches) {
+            if (x.round <= target.round) continue;
+            let hit = false;
+            for (const k of ['player1_id', 'player2_id', 'winner_id', 'forfeit_player_id']) {
+                if (x[k] === oldWinnerId) { x[k] = newWinner; hit = true; }
+            }
+            if (hit) changed.push(x);
+        }
+        return changed;
+    }
+    if (mode === 'cascade') {
+        const changed = [];
+        let cur = target, nx = next;
+        while (nx) {
+            const key = cur.slot % 2 === 1 ? 'player1_id' : 'player2_id';
+            nx[key] = cur.status === 'complete' ? cur.winner_id : null;
+            const wasPlayed = nx.status === 'complete' && !nx.is_bye;
+            if (wasPlayed) clearMatchResult(nx);
+            nx.status = statusByPlayers(nx);
+            changed.push(nx);
+            if (!wasPlayed) break;
+            cur = nx;
+            nx = nextElimMatch(matches, cur);
+        }
+        return changed;
+    }
+    throw Object.assign(new Error(`รอบหลังกรอกผลไปแล้ว ${played.length} แมตช์ — เลือกว่าจะ "สลับชื่อ" หรือ "ล้างสาย"`),
+        { code: 'NEEDS_MODE', affected: played.map(x => ({ id: x.id, round: x.round, slot: x.slot })) });
+}
+
 // ---------- รอบปัจจุบัน / สถานะ ----------
 function currentRoundOf(tournament, matches) {
     if (!matches.length) return 0;
@@ -352,5 +416,6 @@ module.exports = {
     placementExp, calcExp, pointsQuota, calcPoints, describePoints, describeExp,
     shuffle, swissRoundsFor, elimRoundsFor, totalRounds, computeStats, standings,
     pairSwissRound, seedOrder, buildElimBracket, nextElimMatch, applyElimAdvance,
+    elimPlayedDownstream, applyElimCorrection,
     currentRoundOf, isRoundComplete, allComplete, rewardsPreview,
 };

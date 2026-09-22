@@ -79,6 +79,9 @@ function buildView({ tournament, players, matches }) {
         canNextRound: running && tournament.format === 'swiss' && roundComplete && current < total,
         canFinish: running && everything && (tournament.format === 'single_elim' || current >= total),
         allMatchesComplete: everything,
+        // แก้ผลย้อนหลัง
+        canRollback: running && tournament.format === 'swiss' && tournament.current_round > 1,
+        rewardsGiven: !!tournament.points_awarded_at || expAwarded(tournament),
         // ผลนิ่งแล้ว (กรอกครบ + แข่งครบรอบ หรือปิดจ็อบแล้ว) → กดแจกแต้ม/EXP ได้
         resultsFinal: tournament.status === 'finished' || (running && everything && (tournament.format === 'single_elim' || current >= total)),
         rewards: E.rewardsOf(tournament),
@@ -92,6 +95,7 @@ function buildView({ tournament, players, matches }) {
             rank: r.rank, wins: r.wins, losses: r.losses, played: r.played, byes: r.byes,
             buchholz: r.buchholz, forfeit: r.forfeit, dropped: !!r.player.dropped_at,
             points: r.points, exp: r.exp, playedAll: r.playedAll,
+            closed_rank: r.player.final_rank ?? null, // อันดับตอนปิดจ็อบครั้งล่าสุด (ใช้เทียบหลังเปิดงานใหม่)
         })),
     };
 }
@@ -386,23 +390,66 @@ async function nextRound(idOrCode) {
 }
 
 // ---------------------------------------------------------
-// กรอกผล
+// 📝 บันทึกการแก้ไข (tournament_audit) — ไม่ทำให้งานหลักล้มถ้าเขียนไม่สำเร็จ
+// actor = { id, name } จาก req.user ของเว็บ (บอทส่ง { name: 'Discord: ...' })
+// ---------------------------------------------------------
+const matchSnap = m => m && ({
+    id: m.id, round: m.round, slot: m.slot, player1_id: m.player1_id, player2_id: m.player2_id,
+    winner_id: m.winner_id, score1: m.score1 ?? null, score2: m.score2 ?? null,
+    forfeit_player_id: m.forfeit_player_id ?? null, status: m.status, is_bye: !!m.is_bye,
+});
+async function audit(t, { action, match_id = null, reason = null, actor = null, before = null, after = null }) {
+    try {
+        await run(db().from('tournament_audit').insert({
+            tournament_id: t.id, match_id, action, reason: reason || null,
+            actor_id: actor?.id || null, actor_name: actor?.name || null, before, after,
+        }));
+    } catch (err) {
+        console.error('[tournament audit]', err?.message || err);
+    }
+}
+function needReason(reason, what) {
+    const r = clean(reason, 500);
+    if (!r) throw new ServiceError(`${what} ต้องใส่เหตุผลด้วย (เก็บไว้ในบันทึกการแก้ไข)`);
+    return r;
+}
+
+async function listAudit(idOrCode, { limit = 100 } = {}) {
+    const t = await getTournament(idOrCode);
+    return run(db().from('tournament_audit').select('*').eq('tournament_id', t.id)
+        .order('created_at', { ascending: false }).limit(Math.min(Number(limit) || 100, 500)));
+}
+
+// ---------------------------------------------------------
+// กรอกผล / แก้ผลย้อนหลัง
+// Swiss: แก้ได้ทุกรอบ (รอบที่ผ่านมาแล้วต้องใส่เหตุผล) การจับคู่รอบหลังคงเดิม ตารางคะแนนคำนวณใหม่เอง
+// แพ้คัดออก: ถ้าเปลี่ยนผู้ชนะแล้วรอบหลังมีผลแล้ว ต้องเลือก mode 'swap' (สลับชื่อ) หรือ 'cascade' (ล้างสาย)
 // ---------------------------------------------------------
 async function loadMatchContext(matchId) {
+    if (!UUID_RE.test(String(matchId || ''))) throw new ServiceError('ไม่พบแมตช์นี้', 404);
     const m = await run(db().from('tournament_matches').select('*').eq('id', matchId).single(), 'ไม่พบแมตช์นี้');
     const full = await getFull(m.tournament_id);
-    if (full.tournament.status !== 'running') throw new ServiceError('งานนี้ไม่ได้อยู่ระหว่างแข่ง');
-    if (m.is_bye) throw new ServiceError('แมตช์บายไม่ต้องกรอกผล');
     const t = full.tournament;
-    if (t.format === 'swiss' && m.round !== t.current_round) {
-        throw new ServiceError(`แก้ได้เฉพาะผลของรอบปัจจุบัน (รอบ ${t.current_round})`);
-    }
-    return { m, full, t };
+    if (t.status === 'finished') throw new ServiceError('งานนี้ปิดจ็อบแล้ว — กด "เปิดงานใหม่" ในแท็บปิดจ็อบก่อนแก้ผล');
+    if (t.status !== 'running') throw new ServiceError('งานนี้ไม่ได้อยู่ระหว่างแข่ง');
+    if (m.is_bye) throw new ServiceError('แมตช์บายไม่ต้องกรอกผล');
+    const target = full.matches.find(x => x.id === m.id);
+    const before = matchSnap(target);
+    return { m, full, t, target, before };
+}
+
+// Swiss รอบที่ผ่านไปแล้ว หรือแพ้คัดออกที่รอบหลังมีผลแล้ว = "แก้ย้อนหลัง" ต้องมีเหตุผล
+function isBackdated(t, full, m) {
+    if (t.format === 'swiss') return m.round < t.current_round;
+    return E.elimPlayedDownstream(full.matches, m).length > 0;
 }
 
 async function saveElimChain(full, changed) {
     // changed = แมตช์ที่ต้องเขียนกลับ (object จาก full.matches)
+    const seen = new Set();
     for (const x of changed) {
+        if (!x || seen.has(x.id)) continue;
+        seen.add(x.id);
         await run(db().from('tournament_matches').update({
             player1_id: x.player1_id, player2_id: x.player2_id, winner_id: x.winner_id,
             score1: x.score1 ?? null, score2: x.score2 ?? null, status: x.status,
@@ -412,8 +459,16 @@ async function saveElimChain(full, changed) {
     }
 }
 
-async function reportResult(matchId, { winner, score1, score2, forfeit } = {}) {
-    const { m, full, t } = await loadMatchContext(matchId);
+function elimCorrection(full, target, oldWinner, mode) {
+    try {
+        return E.applyElimCorrection(full.matches, target, oldWinner, mode === 'swap' || mode === 'cascade' ? mode : null);
+    } catch (err) {
+        throw new ServiceError(err.message, err.code === 'NEEDS_MODE' ? 409 : 400);
+    }
+}
+
+async function reportResult(matchId, { winner, score1, score2, forfeit, reason, mode } = {}, actor = null) {
+    const { m, full, t, target, before } = await loadMatchContext(matchId);
     if (m.status === 'pending' || !m.player1_id || !m.player2_id) throw new ServiceError('แมตช์นี้ยังรอผู้เล่นจากรอบก่อน');
 
     const winnerId = winner === 'p1' || winner === m.player1_id ? m.player1_id
@@ -422,35 +477,114 @@ async function reportResult(matchId, { winner, score1, score2, forfeit } = {}) {
     const loserId = winnerId === m.player1_id ? m.player2_id : m.player1_id;
     const toScore = v => (v === '' || v === null || v === undefined ? null : Number.isInteger(Number(v)) ? Number(v) : null);
 
-    const target = full.matches.find(x => x.id === m.id);
+    const backdated = isBackdated(t, full, target);
+    const why = backdated ? needReason(reason, 'แก้ผลย้อนหลัง') : clean(reason, 500) || null;
+    const oldWinner = target.status === 'complete' ? target.winner_id : null;
+
     Object.assign(target, {
         winner_id: winnerId, status: 'complete',
         score1: toScore(score1), score2: toScore(score2),
         forfeit_player_id: forfeit ? loserId : null,
-        completed_at: new Date().toISOString(),
+        completed_at: target.completed_at && oldWinner ? target.completed_at : new Date().toISOString(),
     });
 
     const changed = [target];
-    if (t.format === 'single_elim') {
-        const next = E.applyElimAdvance(full.matches, target); // โยน error ถ้ารอบถัดไปกรอกผลไปแล้ว
-        if (next) changed.push(next);
-    }
+    if (t.format === 'single_elim') changed.push(...elimCorrection(full, target, oldWinner, mode));
     await saveElimChain(full, changed);
+
+    if (before.status === 'complete' || backdated) {
+        await audit(t, {
+            action: 'edit_result', match_id: m.id, reason: why, actor,
+            before: { match: before, mode: t.format === 'single_elim' && changed.length > 1 ? (mode || null) : null },
+            after: { match: matchSnap(target), downstream: changed.slice(1).map(matchSnap) },
+        });
+    }
     events.emit('match', t, target);
     return view(t.id);
 }
 
-async function clearResult(matchId) {
-    const { m, full, t } = await loadMatchContext(matchId);
-    const target = full.matches.find(x => x.id === m.id);
+async function clearResult(matchId, { reason } = {}, actor = null) {
+    const { m, full, t, target, before } = await loadMatchContext(matchId);
+    if (target.status !== 'complete') throw new ServiceError('แมตช์นี้ยังไม่มีผล');
+    const backdated = isBackdated(t, full, target);
+    const why = backdated ? needReason(reason, 'ล้างผลย้อนหลัง') : clean(reason, 500) || null;
+    const oldWinner = target.winner_id;
     Object.assign(target, { winner_id: null, status: 'open', score1: null, score2: null, forfeit_player_id: null, completed_at: null });
     const changed = [target];
-    if (t.format === 'single_elim') {
-        const next = E.applyElimAdvance(full.matches, target);
-        if (next) changed.push(next);
-    }
+    // ล้างผลแล้วรอบหลังมีผล → ต้องล้างสายเท่านั้น
+    if (t.format === 'single_elim') changed.push(...elimCorrection(full, target, oldWinner, backdated ? 'cascade' : null));
     await saveElimChain(full, changed);
+    await audit(t, {
+        action: 'clear_result', match_id: m.id, reason: why, actor,
+        before: { match: before }, after: { match: matchSnap(target), downstream: changed.slice(1).map(matchSnap) },
+    });
     events.emit('match', t, target);
+    return view(t.id);
+}
+
+// Swiss: ย้อนกลับไปรอบ N — ลบทุกแมตช์หลังรอบ N แล้วให้จับคู่รอบ N+1 ใหม่
+async function rollbackRound(idOrCode, toRound, { reason } = {}, actor = null) {
+    const full = await getFull(idOrCode);
+    const t = full.tournament;
+    if (t.format !== 'swiss') throw new ServiceError('ย้อนรอบใช้ได้เฉพาะ Swiss (แพ้คัดออกให้แก้ผลแมตช์แล้วเลือก "ล้างสาย")');
+    if (t.status === 'finished') throw new ServiceError('งานนี้ปิดจ็อบแล้ว — กด "เปิดงานใหม่" ก่อน');
+    if (t.status !== 'running') throw new ServiceError('งานนี้ไม่ได้อยู่ระหว่างแข่ง');
+    const n = Number(toRound);
+    if (!Number.isInteger(n) || n < 1 || n >= t.current_round) throw new ServiceError(`เลือกรอบ 1–${t.current_round - 1} (ตอนนี้อยู่รอบ ${t.current_round})`);
+    const why = needReason(reason, 'ย้อนรอบ');
+
+    const removed = full.matches.filter(x => x.round > n);
+    const locked = await run(db().from('tournaments')
+        .update({ current_round: n, round_ends_at: null })
+        .eq('id', t.id).eq('current_round', t.current_round).eq('status', 'running').select());
+    if (!locked.length) throw new ServiceError('มีคนเปลี่ยนรอบไปแล้ว ลองโหลดหน้าใหม่');
+    await run(db().from('tournament_matches').delete().eq('tournament_id', t.id).gt('round', n));
+
+    await audit(t, {
+        action: 'rollback_round', reason: why, actor,
+        before: { current_round: t.current_round, removed: removed.map(matchSnap) },
+        after: { current_round: n },
+    });
+    events.emit('match', locked[0], null);
+    return view(t.id);
+}
+
+// เปิดงานที่ปิดจ็อบแล้วกลับมาแข่งต่อ — หักสถิติที่เคยบวกคืน · แต้ม/EXP ที่แจกแล้วคงไว้ ไม่แจกซ้ำ
+async function reopenTournament(idOrCode, { reason } = {}, actor = null) {
+    const full = await getFull(idOrCode);
+    const t = full.tournament;
+    if (t.status !== 'finished') throw new ServiceError('เปิดงานใหม่ได้เฉพาะงานที่ปิดจ็อบแล้ว');
+    const why = needReason(reason, 'เปิดงานใหม่');
+    const res = await run(db().rpc('t_reopen', { p_tournament_id: t.id }));
+    await audit(t, {
+        action: 'reopen', reason: why, actor,
+        before: {
+            status: t.status, finished_at: t.finished_at,
+            final_ranks: full.players.filter(p => p.final_rank).map(p => ({ player_id: p.id, name: p.display_name, rank: p.final_rank })),
+        },
+        after: { status: 'running', stats_reversed: res?.stats_reversed?.length ?? 0 },
+    });
+    const fresh = await getTournament(t.id);
+    events.emit('tournament', fresh);
+    events.emit('match', fresh, null);
+    return view(t.id);
+}
+
+// ล้างผลทั้งงาน กลับไปเปิดรับสมัคร (คงรายชื่อผู้เล่น) — แต้ม/EXP ที่แจกแล้วคงไว้ ไม่แจกซ้ำ
+async function resetTournament(idOrCode, { reason } = {}, actor = null) {
+    const full = await getFull(idOrCode);
+    const t = full.tournament;
+    if (!['running', 'finished'].includes(t.status)) throw new ServiceError('รีเซ็ตได้เฉพาะงานที่เริ่มแข่งแล้ว');
+    const why = needReason(reason, 'รีเซ็ตผล');
+    const res = await run(db().rpc('t_reset', { p_tournament_id: t.id }));
+    await audit(t, {
+        action: 'reset', reason: why, actor,
+        before: { status: t.status, current_round: t.current_round, matches: full.matches.map(matchSnap) },
+        after: { status: 'registration', matches_deleted: res?.matches_deleted ?? 0, stats_reversed: res?.stats_reversed?.length ?? 0 },
+    });
+    const fresh = await getTournament(t.id);
+    events.emit('tournament', fresh);
+    events.emit('match', fresh, null);
     return view(t.id);
 }
 
@@ -638,5 +772,6 @@ module.exports = {
     createTournament, updateTournament, cancelTournament, setDiscordRefs,
     findAccountByDiscord, searchAccounts, addPlayer, removePlayer, removePlayerByDiscord, setDropped, renamePlayer,
     startTournament, nextRound, reportResult, clearResult, startTimer, stopTimer,
+    rollbackRound, reopenTournament, resetTournament, listAudit,
     awardPoints, awardExp, finish, expAwarded,
 };

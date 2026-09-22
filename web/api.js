@@ -51,6 +51,8 @@ function adminOnly(req, res, next) {
     next();
 }
 
+const actorOf = req => ({ id: req.user?.id || null, name: req.user?.name || req.user?.email || null });
+
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res)).then(data => res.json(data ?? { ok: true })).catch(next);
 
 function buildRouter() {
@@ -92,8 +94,14 @@ function buildRouter() {
 
     r.post('/tournaments/:id/start', wrap(req => S.startTournament(req.params.id)));
     r.post('/tournaments/:id/next-round', wrap(req => S.nextRound(req.params.id)));
-    r.post('/matches/:mid/result', wrap(req => S.reportResult(req.params.mid, req.body || {})));
-    r.post('/matches/:mid/clear', wrap(req => S.clearResult(req.params.mid)));
+    r.post('/matches/:mid/result', wrap(req => S.reportResult(req.params.mid, req.body || {}, actorOf(req))));
+    r.post('/matches/:mid/clear', wrap(req => S.clearResult(req.params.mid, req.body || {}, actorOf(req))));
+
+    // ↩️ แก้ย้อนหลัง (สตาฟทำได้ทุกอย่าง · ทุกครั้งบันทึกลง tournament_audit)
+    r.post('/tournaments/:id/rollback', wrap(req => S.rollbackRound(req.params.id, req.body?.round, req.body || {}, actorOf(req))));
+    r.post('/tournaments/:id/reopen', wrap(req => S.reopenTournament(req.params.id, req.body || {}, actorOf(req))));
+    r.post('/tournaments/:id/reset', wrap(req => S.resetTournament(req.params.id, req.body || {}, actorOf(req))));
+    r.get('/tournaments/:id/audit', wrap(req => S.listAudit(req.params.id)));
 
     r.post('/tournaments/:id/timer', wrap(req => S.startTimer(req.params.id, req.body?.minutes)));
     r.delete('/tournaments/:id/timer', wrap(req => S.stopTimer(req.params.id)));

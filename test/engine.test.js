@@ -149,3 +149,88 @@ test('rewardsPreview respects give_points / give_exp', () => {
     const off = E.rewardsPreview({ format: 'swiss', swiss_rounds: 3, give_points: false, give_exp: false }, players, matches);
     assert.ok(off.every(r => r.points === 0 && r.exp === 0));
 });
+
+// ---------- แก้ผลย้อนหลัง (แพ้คัดออก) ----------
+function playElim(n) {
+    const players = mkPlayers(n);
+    const matches = E.buildElimBracket(players).map((m, i) => ({ ...m, id: `e${i + 1}` }));
+    // ทุกแมตช์ให้ player1 ชนะ ไล่ไปจนจบ
+    for (let r = 1; r <= E.elimRoundsFor(n); r++) {
+        for (const m of matches.filter(x => x.round === r && !x.is_bye)) {
+            m.winner_id = m.player1_id; m.status = 'complete';
+            E.applyElimAdvance(matches, m);
+        }
+    }
+    return { players, matches };
+}
+const at = (ms, r, s) => ms.find(m => m.round === r && m.slot === s);
+
+test('elim correction: needs mode when later rounds already played', () => {
+    const { matches } = playElim(8);
+    const m = at(matches, 1, 1);
+    const old = m.winner_id;
+    m.winner_id = m.player2_id;
+    assert.throws(() => E.applyElimCorrection(matches, m, old), e => e.code === 'NEEDS_MODE' && e.affected.length === 2);
+});
+
+test('elim correction: swap replaces the name downstream and keeps results', () => {
+    const { matches } = playElim(8);
+    const m = at(matches, 1, 1);
+    const old = m.winner_id, neu = m.player2_id;
+    m.winner_id = neu;
+    const changed = E.applyElimCorrection(matches, m, old, 'swap');
+    assert.strictEqual(changed.length, 2);
+    assert.strictEqual(at(matches, 2, 1).player1_id, neu);
+    assert.strictEqual(at(matches, 2, 1).winner_id, neu);
+    assert.strictEqual(at(matches, 3, 1).winner_id, neu);
+    assert.ok(matches.every(x => x.status === 'complete'));
+    assert.ok(!matches.some(x => x.round > 1 && [x.player1_id, x.player2_id, x.winner_id].includes(old)));
+});
+
+test('elim correction: cascade clears the path and seats the new winner', () => {
+    const { matches } = playElim(8);
+    const m = at(matches, 1, 1);
+    const old = m.winner_id, neu = m.player2_id;
+    m.winner_id = neu;
+    const changed = E.applyElimCorrection(matches, m, old, 'cascade');
+    assert.strictEqual(changed.length, 2);
+    const r2 = at(matches, 2, 1), fin = at(matches, 3, 1);
+    assert.strictEqual(r2.player1_id, neu);
+    assert.strictEqual(r2.status, 'open');
+    assert.strictEqual(r2.winner_id, null);
+    assert.strictEqual(fin.player1_id, null);
+    assert.strictEqual(fin.status, 'pending');
+    assert.strictEqual(fin.winner_id, null);
+    // อีกฝั่งของสายไม่ถูกแตะ
+    assert.strictEqual(at(matches, 2, 2).status, 'complete');
+});
+
+test('elim correction: score-only edit touches nothing downstream', () => {
+    const { matches } = playElim(8);
+    const m = at(matches, 1, 1);
+    m.score1 = 2; m.score2 = 1;
+    assert.deepStrictEqual(E.applyElimCorrection(matches, m, m.winner_id), []);
+});
+
+test('elim correction: clearing with cascade empties the next slot', () => {
+    const { matches } = playElim(4);
+    const m = at(matches, 1, 2);
+    const old = m.winner_id;
+    Object.assign(m, { winner_id: null, status: 'open' });
+    E.applyElimCorrection(matches, m, old, 'cascade');
+    const fin = at(matches, 2, 1);
+    assert.strictEqual(fin.player2_id, null);
+    assert.strictEqual(fin.status, 'pending');
+
+    const b = playElim(4).matches, m2 = at(b, 1, 2), old2 = m2.winner_id;
+    Object.assign(m2, { winner_id: null, status: 'open' });
+    assert.throws(() => E.applyElimCorrection(b, m2, old2, 'swap'), e => e.code === 'BAD_MODE');
+});
+
+test('swiss: re-pairing after rollback avoids pairs from kept rounds', () => {
+    const { players, matches } = playSwiss(8, 3);
+    const kept = matches.filter(m => m.round <= 1);
+    const again = E.pairSwissRound(players, kept, 2);
+    const seen = new Set(kept.filter(m => !m.is_bye).map(m => [m.player1_id, m.player2_id].sort().join('|')));
+    assert.ok(again.filter(m => !m.is_bye).every(m => !seen.has([m.player1_id, m.player2_id].sort().join('|'))));
+});

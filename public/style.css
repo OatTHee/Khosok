@@ -147,10 +147,13 @@ dialog form { padding: 18px; display: flex; flex-direction: column; gap: 14px; }
 .divider { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: .8rem; }
 .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
 .empty { text-align: center; padding: 40px 16px; color: var(--muted); }
+.show-sm { display: none; }
+.notice.small { font-size: .82rem; margin-bottom: 10px; }
 
 @media (max-width: 640px) {
   h1 { font-size: 1.25rem; }
   .hide-sm { display: none; }
+  .show-sm { display: inline; }
   th, td { padding: 8px 6px; }
   .seg { grid-template-columns: 1fr; }
 }

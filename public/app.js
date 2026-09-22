@@ -397,6 +397,7 @@ function renderDetail() {
     ['standings', 'ตารางคะแนน'],
     ['finish', t.give_points === false && t.give_exp === false ? 'ปิดจ็อบ' : 'แจกรางวัล & ปิดจ็อบ'],
     ['settings', 'ตั้งค่า'],
+    ['log', 'บันทึกการแก้ไข'],
   ];
   $('#app').innerHTML = `
     <a href="#/" class="small muted" style="text-decoration:none">← งานแข่งทั้งหมด</a>
@@ -432,7 +433,7 @@ function renderDetail() {
   startTick();
 
   const tab = $('#tab');
-  ({ players: renderPlayers, matches: renderMatches, standings: renderStandings, finish: renderFinish, settings: renderSettings }[S.tab] || renderPlayers)(tab, v);
+  ({ players: renderPlayers, matches: renderMatches, standings: renderStandings, finish: renderFinish, settings: renderSettings, log: renderLog }[S.tab] || renderPlayers)(tab, v);
 }
 
 function startTick() {
@@ -572,6 +573,24 @@ function renderPlayers(el, v) {
 // ---------- matches tab ----------
 function nameMap(v) { return Object.fromEntries(v.players.map(p => [p.id, p.display_name])); }
 
+// ---------- แก้ผลย้อนหลัง: ตัวช่วยฝั่งหน้าเว็บ (ตรงกับ tournament/engine.js) ----------
+const nextElim = (matches, m) => matches.find(x => x.round === m.round + 1 && x.slot === Math.ceil(m.slot / 2)) || null;
+function elimPlayedDownstream(matches, m) {
+  const out = [];
+  let cur = nextElim(matches, m);
+  while (cur) { if (cur.status === 'complete' && !cur.is_bye) out.push(cur); cur = nextElim(matches, cur); }
+  return out;
+}
+// แก้ย้อนหลัง = Swiss รอบที่ผ่านไปแล้ว / แพ้คัดออกที่รอบหลังกรอกผลแล้ว → ต้องใส่เหตุผล
+function isBackdated(m, v) {
+  const t = v.tournament;
+  if (t.format === 'swiss') return m.round < t.current_round;
+  return elimPlayedDownstream(v.matches, m).length > 0;
+}
+const reasonField = (required, placeholder = 'เช่น คีย์ผู้ชนะสลับกัน / ผู้เล่นแจ้งหลังจบรอบ') => `
+  <label class="field">เหตุผล${required ? '' : ' (ไม่บังคับ)'}<textarea name="reason" rows="2" maxlength="500" ${required ? 'required' : ''} placeholder="${esc(placeholder)}"></textarea>
+    <span class="hint">เก็บไว้ในแท็บ "บันทึกการแก้ไข" พร้อมชื่อคนแก้</span></label>`;
+
 function matchCard(m, v, names) {
   const t = v.tournament;
   if (m.is_bye) {
@@ -579,25 +598,105 @@ function matchCard(m, v, names) {
       <div class="side win"><span class="n">${esc(names[m.player1_id || m.player2_id])}</span><span class="small">ชนะบาย</span></div></div>`;
   }
   const done = m.status === 'complete';
-  const editable = t.status === 'running' && (t.format === 'single_elim' || m.round === t.current_round);
+  const running = t.status === 'running';
+  const back = running && isBackdated(m, v);
+  const editable = running && !back; // กรอกผลปกติ (ปุ่ม "ชนะ" บนการ์ด)
   const side = (pid, key, score) => {
     const cls = done ? (m.winner_id === pid ? 'win' : 'lose') : '';
     return `<div class="side ${cls}"><span class="n">${esc(names[pid] || 'รอผู้ชนะ')}</span>${done
       ? `<span class="small">${m.winner_id === pid ? '🏆 ชนะ' : (m.forfeit_player_id === pid ? 'ปรับแพ้' : '')}${score !== null && score !== undefined ? ` · ${score}` : ''}</span>`
       : editable && pid ? `<button class="btn sm" data-win="${m.id}" data-side="${key}">ชนะ</button>` : ''}</div>`;
   };
+  let foot = '';
+  if (running && done) {
+    foot = back
+      ? `<div class="match-foot"><span class="muted small">↩️ แก้ย้อนหลัง (ต้องใส่เหตุผล)</span><button class="btn ghost sm" data-edit="${m.id}">แก้ผล</button></div>`
+      : `<div class="match-foot"><span class="muted">แก้ไขผล</span><span class="row" style="gap:6px"><button class="btn ghost sm" data-edit="${m.id}">แก้ผล</button><button class="btn ghost sm" data-clear="${m.id}">ล้างผล</button></span></div>`;
+  } else if (running && m.status === 'open') {
+    foot = back
+      ? `<div class="match-foot"><span class="muted small">รอบที่ผ่านไปแล้ว</span><button class="btn sm" data-edit="${m.id}">กรอกผลย้อนหลัง</button></div>`
+      : `<div class="match-foot">
+          <span class="row" style="gap:6px">สกอร์ <input type="number" min="0" max="99" data-s1="${m.id}" aria-label="สกอร์ผู้เล่น 1"> - <input type="number" min="0" max="99" data-s2="${m.id}" aria-label="สกอร์ผู้เล่น 2"></span>
+          <label class="row" style="gap:6px"><input type="checkbox" data-ff="${m.id}"> ปรับแพ้ (ถอนตัว/ฟาวล์)</label>
+        </div>`;
+  }
   return `<div class="card match ${done ? 'done' : ''}" data-match="${m.id}">
     <div class="match-top"><b>โต๊ะ ${m.slot}</b>${done ? '<span class="badge green">กรอกผลแล้ว</span>' : m.status === 'pending' ? '<span class="badge">รอคู่แข่ง</span>' : '<span class="badge info">กำลังแข่ง</span>'}</div>
     ${side(m.player1_id, 'p1', m.score1)}
     <div class="vs">VS</div>
     ${side(m.player2_id, 'p2', m.score2)}
-    ${editable ? (done
-      ? `<div class="match-foot"><span class="muted">กดล้างผลเพื่อแก้ไข</span><button class="btn ghost sm" data-clear="${m.id}">ล้างผล</button></div>`
-      : m.status === 'open' ? `<div class="match-foot">
-          <span class="row" style="gap:6px">สกอร์ <input type="number" min="0" max="99" data-s1="${m.id}" aria-label="สกอร์ผู้เล่น 1"> - <input type="number" min="0" max="99" data-s2="${m.id}" aria-label="สกอร์ผู้เล่น 2"></span>
-          <label class="row" style="gap:6px"><input type="checkbox" data-ff="${m.id}"> ปรับแพ้ (ถอนตัว/ฟาวล์)</label>
-        </div>` : '') : ''}
+    ${foot}
   </div>`;
+}
+
+// หน้าต่างแก้ผล (ใช้ทั้งแก้ผลรอบปัจจุบัน และแก้ย้อนหลัง)
+function openEditMatch(m, v) {
+  const t = v.tournament, names = nameMap(v);
+  const back = isBackdated(m, v);
+  const downstream = t.format === 'single_elim' ? elimPlayedDownstream(v.matches, m) : [];
+  const done = m.status === 'complete';
+  const canClear = done && !(t.format === 'swiss' && back); // Swiss รอบเก่า: แก้ได้ แต่ไม่ล้างทิ้ง
+  const where = t.format === 'single_elim' ? `รอบ ${m.round} คู่ ${m.slot}` : `รอบ ${m.round} โต๊ะ ${m.slot}`;
+  const radio = (key, pid) => `<label><input type="radio" name="winner" value="${key}" ${done && m.winner_id === pid ? 'checked' : ''} required><span><b>${esc(names[pid])}</b></span></label>`;
+  openDialog(`
+    <h2>${done ? 'แก้ผล' : 'กรอกผล'} · ${where}</h2>
+    ${t.format === 'swiss' && back ? `<div class="notice warn small">รอบนี้ผ่านไปแล้ว — ตารางคะแนนและ BH จะคำนวณใหม่ แต่การจับคู่รอบหลังที่แข่งไปแล้วคงเดิม<br>ถ้ารอบถัดไปยังไม่ได้เริ่มเล่นจริง ใช้ปุ่ม "ย้อนกลับไปรอบนี้" เพื่อจับคู่ใหม่แทน</div>` : ''}
+    ${v.rewardsGiven ? '<div class="notice warn small">งานนี้แจกแต้ม/EXP ไปแล้วตามผลเดิม — แก้ผลตอนนี้จะไม่เปลี่ยนแต้ม/EXP ที่แจกไป</div>' : ''}
+    <div class="field"><span>ผู้ชนะ</span><div class="seg">${radio('p1', m.player1_id)}${radio('p2', m.player2_id)}</div></div>
+    <div class="row">
+      <label class="field" style="flex:1">สกอร์ ${esc(names[m.player1_id])}<input type="number" name="s1" min="0" max="99" value="${m.score1 ?? ''}"></label>
+      <label class="field" style="flex:1">สกอร์ ${esc(names[m.player2_id])}<input type="number" name="s2" min="0" max="99" value="${m.score2 ?? ''}"></label>
+    </div>
+    <label class="row" style="gap:6px;margin-bottom:12px"><input type="checkbox" name="ff" ${m.forfeit_player_id ? 'checked' : ''}> ผู้แพ้โดนปรับแพ้ (ถอนตัว/ฟาวล์)</label>
+    ${downstream.length ? `
+    <div class="field"><span>รอบหลังกรอกผลไปแล้ว ${downstream.length} แมตช์ (${downstream.map(x => `รอบ ${x.round} คู่ ${x.slot}`).join(', ')}) — ถ้าเปลี่ยนตัวผู้ชนะ ให้เลือก</span>
+      <div class="seg">
+        <label><input type="radio" name="mode" value="swap"><span><b>สลับชื่อ</b><br><span class="hint">คีย์ผิดคน แต่คนที่ชนะจริงเป็นคนไปแข่งต่อ → แทนชื่อในรอบหลัง ผลเดิมคงไว้</span></span></label>
+        <label><input type="radio" name="mode" value="cascade"><span><b>ล้างสาย</b><br><span class="hint">ล้างผลทุกแมตช์ที่ต่อจากนี้ แล้วแข่ง/กรอกใหม่</span></span></label>
+      </div>
+    </div>` : ''}
+    ${reasonField(back)}
+    <div class="dlg-actions">
+      <button class="btn secondary" value="cancel">ยกเลิก</button>
+      ${canClear ? `<button class="btn ghost" value="clear" formnovalidate title="${downstream.length ? `ล้างผลของ ${downstream.map(x => `รอบ ${x.round} คู่ ${x.slot}`).join(', ')} ด้วย` : ''}">ล้างผล${downstream.length ? ` + ล้างสาย ${downstream.length} แมตช์` : ''}</button>` : ''}
+      <button class="btn" value="ok">บันทึก</button>
+    </div>`, async (f, action) => {
+    const reason = String(f.get('reason') || '').trim();
+    if (back && !reason) { toast('ต้องใส่เหตุผลของการแก้ย้อนหลัง', true); return false; }
+    if (action === 'clear') {
+      // ล้างผลคู่ที่รอบหลังมีผลแล้ว = ล้างสายเสมอ (แจ้งไว้บนปุ่มแล้ว)
+      const out = await act(() => api('POST', `/matches/${m.id}/clear`, { reason }), downstream.length ? `ล้างผลและล้างสาย ${downstream.length} แมตช์แล้ว` : 'ล้างผลแล้ว');
+      if (!out) return false;
+      return;
+    }
+    const winner = f.get('winner');
+    if (!winner) { toast('ต้องเลือกผู้ชนะ', true); return false; }
+    const newWinner = winner === 'p1' ? m.player1_id : m.player2_id;
+    const mode = f.get('mode');
+    if (downstream.length && done && newWinner !== m.winner_id && !mode) { toast('เลือก "สลับชื่อ" หรือ "ล้างสาย" ก่อน', true); return false; }
+    const out = await act(() => api('POST', `/matches/${m.id}/result`, {
+      winner, score1: f.get('s1'), score2: f.get('s2'), forfeit: !!f.get('ff'), reason, mode: mode || undefined,
+    }), 'บันทึกผลแล้ว');
+    if (!out) return false;
+  });
+}
+
+// ย้อนกลับไปรอบ N (Swiss) — ลบทุกรอบหลัง N
+function openRollback(v, round) {
+  const t = v.tournament;
+  const removed = v.matches.filter(m => m.round > round && !m.is_bye);
+  const played = removed.filter(m => m.status === 'complete').length;
+  openDialog(`
+    <h2>↩️ ย้อนกลับไปรอบ ${round}?</h2>
+    <div class="muted">ลบการจับคู่รอบ ${round + 1}–${t.current_round} ทั้งหมด (${removed.length} โต๊ะ${played ? ` · <b>มีผลแล้ว ${played} โต๊ะ จะหายด้วย</b>` : ''}) แล้วกลับมาอยู่รอบ ${round}<br>
+    แก้ผลรอบ ${round} ให้ถูก แล้วกด "จับคู่รอบที่ ${round + 1}" ใหม่</div>
+    ${reasonField(true, 'เช่น คีย์ผลรอบ ' + round + ' ผิด รอบถัดไปยังไม่ได้เริ่มเล่น')}
+    <div class="dlg-actions"><button class="btn secondary" value="cancel">ยกเลิก</button><button class="btn danger" value="ok">ย้อนรอบ</button></div>`,
+  async f => {
+    S.round = round;
+    const out = await act(() => api('POST', `/tournaments/${t.code}/rollback`, { round, reason: f.get('reason') }), `ย้อนกลับไปรอบ ${round} แล้ว`);
+    if (!out) return false;
+  });
 }
 
 function bindMatchActions(el, v) {
@@ -609,8 +708,14 @@ function bindMatchActions(el, v) {
     act(() => api('POST', `/matches/${id}/result`, { winner: b.dataset.side, score1: s1, score2: s2, forfeit: !!ff }), 'บันทึกผลแล้ว', b);
   });
   el.querySelectorAll('[data-clear]').forEach(b => b.onclick = () =>
-    act(() => api('POST', `/matches/${b.dataset.clear}/clear`), 'ล้างผลแล้ว', b));
+    act(() => api('POST', `/matches/${b.dataset.clear}/clear`, {}), 'ล้างผลแล้ว', b));
+  el.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => {
+    const m = v.matches.find(x => x.id === b.dataset.edit);
+    if (m) openEditMatch(m, v);
+  });
 }
+
+const FINISHED_HINT = '<div class="notice">ปิดจ็อบแล้ว — ถ้าคีย์ผิด ไปแท็บ "ปิดจ็อบ" แล้วกด "เปิดงานใหม่เพื่อแก้ผล"</div>';
 
 function renderMatches(el, v) {
   const t = v.tournament;
@@ -623,11 +728,16 @@ function renderMatches(el, v) {
   const list = v.matches.filter(m => m.round === r).sort((a, b) => a.is_bye - b.is_bye || a.slot - b.slot);
   const left = list.filter(m => m.status !== 'complete').length;
 
-  let banner = '';
+  let banner = t.status === 'finished' ? FINISHED_HINT : '';
+  if (t.status === 'running' && v.rewardsGiven) banner += '<div class="notice warn">แจกแต้ม/EXP ไปแล้วตามผลเดิม — แก้ผลตอนนี้จะไม่เปลี่ยนแต้ม/EXP ที่แจกไป (ปรับเองนอกระบบถ้าจำเป็น)</div>';
+  if (t.status === 'running' && r < v.currentRound) {
+    banner += `<div class="notice row" style="justify-content:space-between">รอบที่ผ่านไปแล้ว — กด "แก้ผล" ที่โต๊ะเพื่อแก้ย้อนหลัง (การจับคู่รอบหลังคงเดิม)
+      ${v.canRollback ? `<button class="btn sm danger" id="rollback">↩️ ย้อนกลับไปรอบ ${r}</button>` : ''}</div>`;
+  }
   if (t.status === 'running' && r === v.currentRound) {
-    if (left) banner = `<div class="notice">รอบที่ ${r}: เหลือ ${left} โต๊ะที่ยังไม่กรอกผล</div>`;
-    else if (v.canNextRound) banner = `<div class="notice green row" style="justify-content:space-between">รอบที่ ${r} กรอกผลครบแล้ว <button class="btn sm" id="next2">จับคู่รอบที่ ${r + 1} →</button></div>`;
-    else if (v.canFinish) banner = `<div class="notice green row" style="justify-content:space-between">แข่งครบทุกรอบแล้ว 🎉 <button class="btn sm warn" id="fin2">ไปหน้าปิดจ็อบ</button></div>`;
+    if (left) banner += `<div class="notice">รอบที่ ${r}: เหลือ ${left} โต๊ะที่ยังไม่กรอกผล</div>`;
+    else if (v.canNextRound) banner += `<div class="notice green row" style="justify-content:space-between">รอบที่ ${r} กรอกผลครบแล้ว <button class="btn sm" id="next2">จับคู่รอบที่ ${r + 1} →</button></div>`;
+    else if (v.canFinish) banner += `<div class="notice green row" style="justify-content:space-between">แข่งครบทุกรอบแล้ว 🎉 <button class="btn sm warn" id="fin2">ไปหน้าปิดจ็อบ</button></div>`;
   }
   el.innerHTML = `
     <div class="stack">
@@ -636,6 +746,8 @@ function renderMatches(el, v) {
       <div class="grid">${list.map(m => matchCard(m, v, names)).join('')}</div>
     </div>`;
   el.querySelectorAll('[data-round]').forEach(b => b.onclick = () => { S.round = Number(b.dataset.round); renderDetail(); });
+  const rb = $('#rollback');
+  if (rb) rb.onclick = () => openRollback(v, r);
   const n2 = $('#next2');
   if (n2) n2.onclick = () => { S.round = null; act(() => api('POST', `/tournaments/${t.code}/next-round`), `จับคู่รอบที่ ${r + 1} แล้ว`, n2); };
   const f2 = $('#fin2');
@@ -651,7 +763,9 @@ function renderBracket(el, v) {
   const bp = (m, pid, score) => `<div class="bp ${m.status === 'complete' && m.winner_id === pid ? 'win' : ''}"><span>${esc(names[pid] || (m.is_bye && !pid ? 'บาย' : '—'))}</span><span class="s">${score ?? ''}</span></div>`;
   el.innerHTML = `
     <div class="stack">
-      <div class="notice">กดที่คู่เพื่อกรอกผล — ผู้ชนะจะขึ้นไปรอบถัดไปเอง</div>
+      <div class="notice">กดที่คู่เพื่อกรอกผล/แก้ผล — ผู้ชนะจะขึ้นไปรอบถัดไปเอง · แก้คู่ที่รอบหลังมีผลแล้วได้ (เลือกสลับชื่อหรือล้างสาย)</div>
+      ${v.tournament.status === 'finished' ? FINISHED_HINT : ''}
+      ${v.tournament.status === 'running' && v.rewardsGiven ? '<div class="notice warn">แจกแต้ม/EXP ไปแล้วตามผลเดิม — แก้ผลตอนนี้จะไม่เปลี่ยนแต้ม/EXP ที่แจกไป</div>' : ''}
       <div class="bracket">${rounds.map(r => `
         <div class="bcol"><h3>${roundName(r)}</h3>
           ${v.matches.filter(m => m.round === r).sort((a, b) => a.slot - b.slot).map(m => `
@@ -745,14 +859,38 @@ function renderFinish(el, v) {
   const closeCard = `
     <div class="card pad stack">
       <div class="spread"><h2>🏁 ปิดจ็อบ บันทึกประวัติ</h2>${finished ? '<span class="badge green">ปิดแล้ว</span>' : ''}</div>
-      <div class="muted small">จบงาน บันทึกประวัติการแข่งและสถิติผู้เล่น (ไม่แจก EXP — ใช้ปุ่มแจก EXP แยก)</div>
-      ${finished ? '' : `<button class="btn warn" id="finish" ${v.canFinish ? '' : 'disabled'}>🏁 ปิดจ็อบ & บันทึกประวัติ</button>`}
+      <div class="muted small">จบงาน บันทึกประวัติการแข่งและสถิติผู้เล่น (ไม่แจก EXP — ใช้ปุ่มแจก EXP แยก)${t.reopen_count ? ' · งานนี้เคยเปิดใหม่แล้ว ปิดอีกครั้งจะเขียนทับประวัติเดิม' : ''}</div>
+      ${finished
+        ? `<button class="btn ghost" id="reopen">↩️ เปิดงานใหม่เพื่อแก้ผล</button>
+           <div class="small muted">กลับมาสถานะกำลังแข่ง แก้ผลได้ทุกรอบ แล้วปิดจ็อบใหม่ · สถิติผู้เล่นถูกหักคืนแล้วบันทึกใหม่ตอนปิด · แต้ม/EXP ที่แจกแล้วไม่เปลี่ยน</div>`
+        : `<button class="btn warn" id="finish" ${v.canFinish ? '' : 'disabled'}>🏁 ปิดจ็อบ & บันทึกประวัติ</button>`}
     </div>`;
+
+  // หลังเปิดงานใหม่: เทียบอันดับตอนปิดครั้งก่อนกับอันดับตอนนี้ (ช่วยปรับแต้ม/EXP เองนอกระบบ)
+  const ptsAt = r => (r && r <= v.pointsQuota ? (cfg.points.ranks[r - 1] || 0) : 0);
+  const expAt = r => (r ? (cfg.exp.ranks[r - 1] || 0) : 0);
+  const moved = !finished && t.reopened_at ? v.standings.filter(s => s.closed_rank && s.closed_rank !== s.rank) : [];
+  const compare = moved.length ? `
+    <div class="card pad stack">
+      <h2>↕️ อันดับเปลี่ยนจากตอนปิดจ็อบครั้งก่อน</h2>
+      ${v.rewardsGiven ? '<div class="notice warn small">แต้ม/EXP แจกไปแล้วตามอันดับเดิม ระบบจะไม่แจกซ้ำหรือหักคืน — ถ้าต้องปรับ ให้แอดมินทำเองในเว็บร้าน</div>' : ''}
+      <div class="table-wrap"><table>
+        <thead><tr><th>ชื่อ</th><th class="num">อันดับเดิม → ใหม่</th>${gp && t.points_awarded_at ? '<th class="num">แต้ม (ส่วนต่าง)</th>' : ''}${ge && expDone ? '<th class="num">EXP อันดับ (ส่วนต่าง)</th>' : ''}</tr></thead>
+        <tbody>${moved.map(s => {
+          const dp = ptsAt(s.rank) - ptsAt(s.closed_rank), de = expAt(s.rank) - expAt(s.closed_rank);
+          const sign = n => (n > 0 ? `+${n}` : `${n}`);
+          return `<tr><td><span class="pname">${esc(s.name)}</span></td><td class="num">${s.closed_rank} → <b>${s.rank}</b></td>
+            ${gp && t.points_awarded_at ? `<td class="num">${ptsAt(s.closed_rank)} → ${ptsAt(s.rank)} ${dp ? `<b>(${sign(dp)})</b>` : ''}</td>` : ''}
+            ${ge && expDone ? `<td class="num">${expAt(s.closed_rank)} → ${expAt(s.rank)} ${de ? `<b>(${sign(de)})</b>` : ''}</td>` : ''}</tr>`;
+        }).join('')}</tbody>
+      </table></div>
+    </div>` : '';
 
   el.innerHTML = `
     <div class="stack">
       ${status}
       <div class="grid">${pointsCard}${expCard}${otherCard}${closeCard}</div>
+      ${compare}
       ${unlinked.length ? `<div class="notice warn">walk-in ${unlinked.length} คนไม่มีบัญชี จะไม่ได้แต้ม/EXP: ${unlinked.map(s => esc(s.name)).join(', ')}</div>` : ''}
       <div class="card table-wrap">
         <table>
@@ -790,9 +928,68 @@ function renderFinish(el, v) {
   if (fin) fin.onclick = async () => {
     const left = [gp && !t.points_awarded_at ? 'แต้มแลกการ์ด' : '', ge && !expDone ? 'EXP' : ''].filter(Boolean);
     const extra = left.length ? `<br><b>⚠️ ยังไม่ได้แจก ${left.join(' และ ')}</b> — กดแจกทีหลังได้` : '';
-    if (!await confirmBox('ปิดจ็อบงานนี้?', `บันทึกประวัติการแข่งและสถิติผู้เล่น แล้วปิดงาน<br>ทำแล้วย้อนกลับไม่ได้${extra}`, 'ปิดจ็อบ', true)) return;
+    if (!await confirmBox('ปิดจ็อบงานนี้?', `บันทึกประวัติการแข่งและสถิติผู้เล่น แล้วปิดงาน<br>ถ้าเจอว่าคีย์ผิดทีหลัง กด "เปิดงานใหม่" เพื่อกลับมาแก้ได้${extra}`, 'ปิดจ็อบ', true)) return;
     act(() => api('POST', `/tournaments/${t.code}/finish`), 'ปิดจ็อบและบันทึกประวัติแล้ว', fin);
   };
+  const reo = $('#reopen');
+  if (reo) reo.onclick = () => openDialog(`
+    <h2>↩️ เปิดงานใหม่เพื่อแก้ผล?</h2>
+    <div class="muted">
+      • งานกลับมาสถานะ "กำลังแข่ง" แก้ผลได้ทุกรอบ แล้วกดปิดจ็อบใหม่<br>
+      • สถิติผู้เล่น (แข่ง/แชมป์/Top3/Top5) ที่บันทึกตอนปิดจะถูกหักคืน แล้วบันทึกใหม่ตามผลที่แก้ตอนปิดอีกครั้ง<br>
+      • <b>แต้ม/EXP ที่แจกไปแล้วไม่เปลี่ยน และจะไม่แจกซ้ำ</b> — ถ้าอันดับเปลี่ยน ระบบจะแสดงตารางเทียบให้ปรับเองนอกระบบ
+    </div>
+    ${reasonField(true, 'เช่น เพิ่งรู้ว่าคีย์ผลรอบ 2 โต๊ะ 3 สลับกัน')}
+    <div class="dlg-actions"><button class="btn secondary" value="cancel">ยกเลิก</button><button class="btn warn" value="ok">เปิดงานใหม่</button></div>`,
+  async f => {
+    S.tab = 'matches'; S.round = null;
+    const out = await act(() => api('POST', `/tournaments/${t.code}/reopen`, { reason: f.get('reason') }), 'เปิดงานใหม่แล้ว — แก้ผลได้เลย');
+    if (!out) { S.tab = 'finish'; return false; }
+  });
+}
+
+// ---------- log tab: บันทึกการแก้ไข ----------
+const AUDIT_LABEL = {
+  edit_result: '✏️ แก้ผล', clear_result: '🧽 ล้างผล', rollback_round: '↩️ ย้อนรอบ',
+  reopen: '🔓 เปิดงานใหม่', reset: '🧹 รีเซ็ตผล',
+};
+function auditDetail(a, names) {
+  const n = id => esc(names[id] || (id ? 'ผู้เล่นที่ลบไปแล้ว' : '—'));
+  const res = m => (m?.status === 'complete' ? `${n(m.winner_id)} ชนะ${m.score1 !== null && m.score2 !== null ? ` (${m.score1}-${m.score2})` : ''}${m.forfeit_player_id ? ' [ปรับแพ้]' : ''}` : 'ยังไม่มีผล');
+  const b = a.before || {}, af = a.after || {};
+  switch (a.action) {
+    case 'edit_result':
+    case 'clear_result': {
+      const m = b.match || af.match || {};
+      const down = (af.downstream || []).length;
+      return `รอบ ${m.round} โต๊ะ ${m.slot}: ${n(m.player1_id)} vs ${n(m.player2_id)}<br>${res(b.match)} → <b>${res(af.match)}</b>`
+        + (down ? `<br><span class="muted">${b.mode === 'swap' ? 'สลับชื่อในรอบหลัง' : 'ล้างสาย'} ${down} แมตช์</span>` : '');
+    }
+    case 'rollback_round': return `รอบ ${b.current_round} → รอบ ${af.current_round} (ลบ ${(b.removed || []).filter(m => !m.is_bye).length} โต๊ะ)`;
+    case 'reopen': return `ปิดจ็อบเมื่อ ${fmtDate(b.finished_at)} → กลับมาแข่งต่อ · หักสถิติคืน ${af.stats_reversed ?? 0} คน`;
+    case 'reset': return `ลบ ${af.matches_deleted ?? 0} แมตช์ (เดิมอยู่รอบ ${b.current_round}) → เปิดรับสมัคร`;
+    default: return '';
+  }
+}
+async function renderLog(el, v) {
+  el.innerHTML = '<div class="loading">กำลังโหลด…</div>';
+  let list;
+  try { list = await api('GET', `/tournaments/${v.tournament.code}/audit`); } catch (e) { el.innerHTML = `<div class="card empty">${esc(e.message)}</div>`; return; }
+  if (S.tab !== 'log') return;
+  const names = nameMap(v);
+  el.innerHTML = `
+    <div class="stack">
+      <div class="notice">บันทึกทุกการแก้ผลย้อนหลัง ล้างผล ย้อนรอบ เปิดงานใหม่ และรีเซ็ต — ใครทำ เมื่อไหร่ ค่าเดิม/ค่าใหม่ และเหตุผล</div>
+      <div class="card table-wrap"><table>
+        <thead><tr><th>เวลา</th><th>ทำอะไร</th><th>รายละเอียด</th><th class="hide-sm">โดย</th></tr></thead>
+        <tbody>${list.length ? list.map(a => `<tr>
+          <td class="small muted" style="white-space:nowrap">${fmtDate(a.created_at)}</td>
+          <td style="white-space:nowrap">${AUDIT_LABEL[a.action] || esc(a.action)}</td>
+          <td class="small">${auditDetail(a, names)}${a.reason ? `<br><span class="muted">เหตุผล: ${esc(a.reason)}</span>` : ''}<span class="show-sm muted"> · ${esc(a.actor_name || '-')}</span></td>
+          <td class="hide-sm small">${esc(a.actor_name || '-')}</td>
+        </tr>`).join('') : '<tr><td colspan="4" class="empty">ยังไม่มีการแก้ไข</td></tr>'}</tbody>
+      </table></div>
+    </div>`;
 }
 
 // ---------- staff (แอดมินร้านเท่านั้น) ----------
@@ -871,6 +1068,9 @@ function renderSettings(el, v) {
         <div class="small">ตารางคะแนน: <span class="code">!standing ${t.code}</span></div>
         <div class="small muted">เมื่อจับคู่รอบใหม่จากเว็บ บอทจะโพสต์คู่ในห้องที่ใช้ !setup ให้อัตโนมัติ</div>
       </div>
+      ${t.status === 'running' || t.status === 'finished' ? `<div class="card pad stack"><h2>🧹 รีเซ็ตผลทั้งงาน</h2>
+        <div class="small muted">ลบการจับคู่และผลทุกรอบ กลับไปสถานะเปิดรับสมัคร (รายชื่อผู้เล่นยังอยู่) แล้วกดเริ่มแข่งใหม่ได้${t.status === 'finished' ? ' · สถิติผู้เล่นที่บันทึกตอนปิดจะถูกหักคืน' : ''}${v.rewardsGiven ? '<br><b>แต้ม/EXP แจกไปแล้ว — จะไม่เปลี่ยนและไม่แจกซ้ำ</b>' : ''}</div>
+        <button class="btn danger" id="reset-t">รีเซ็ตผลทั้งงาน</button></div>` : ''}
       ${locked ? '' : `<div class="card pad stack"><h2>ยกเลิกงาน</h2><div class="small muted">ไม่แจกรางวัลใดๆ และปิดงานนี้</div><button class="btn danger" id="cancel-t">ยกเลิกงานแข่ง</button></div>`}
     </div>`;
   const rwf = $('#rw-form');
@@ -896,6 +1096,20 @@ function renderSettings(el, v) {
     if (t.format === 'swiss') body.swiss_rounds = d.get('swiss_rounds') || null;
     act(() => api('PATCH', `/tournaments/${t.code}`, body), 'บันทึกแล้ว', f.querySelector('button'));
   };
+  const rs = $('#reset-t');
+  if (rs) rs.onclick = () => openDialog(`
+    <h2>🧹 รีเซ็ตผลทั้งงาน?</h2>
+    <div class="muted">ลบการจับคู่และผลทั้งหมด ${v.matches.filter(m => !m.is_bye).length} แมตช์ กลับไปเปิดรับสมัคร · seed และการถอนตัวถูกล้าง<br>
+      ${v.rewardsGiven ? '<b>แต้ม/EXP ที่แจกไปแล้วจะไม่เปลี่ยน และแจกซ้ำไม่ได้</b><br>' : ''}ย้อนกลับไม่ได้ (แต่ผลเดิมเก็บไว้ในบันทึกการแก้ไข)</div>
+    <label class="field">พิมพ์ <span class="code">${t.code}</span> เพื่อยืนยัน<input name="confirm" required autocomplete="off" inputmode="numeric"></label>
+    ${reasonField(true, 'เช่น จับคู่ผิดตั้งแต่รอบแรก ขอเริ่มใหม่')}
+    <div class="dlg-actions"><button class="btn secondary" value="cancel">ยกเลิก</button><button class="btn danger" value="ok">รีเซ็ต</button></div>`,
+  async f => {
+    if (String(f.get('confirm')).trim() !== String(t.code)) { toast(`พิมพ์เลขงาน ${t.code} ให้ตรง`, true); return false; }
+    S.tab = 'players'; S.round = null; S.finishChecks = null;
+    const out = await act(() => api('POST', `/tournaments/${t.code}/reset`, { reason: f.get('reason') }), 'รีเซ็ตแล้ว — กลับไปเปิดรับสมัคร');
+    if (!out) { S.tab = 'settings'; return false; }
+  });
   const c = $('#cancel-t');
   if (c) c.onclick = async () => {
     if (!await confirmBox('ยกเลิกงานแข่ง?', 'ไม่มีการแจกแต้ม/EXP และแก้ไขงานนี้ต่อไม่ได้', 'ยกเลิกงาน', true)) return;
