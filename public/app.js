@@ -333,8 +333,24 @@ async function renderList() {
       <h1>งานแข่ง</h1>
       <button class="btn" id="new-t">+ สร้างงานใหม่</button>
     </div>
-    <div class="t-list">${items || '<div class="card empty">ยังไม่มีงานแข่ง กด "สร้างงานใหม่" เพื่อเริ่ม</div>'}</div>`;
+    <div class="t-list">${items || '<div class="card empty">ยังไม่มีงานแข่ง กด "สร้างงานใหม่" เพื่อเริ่ม</div>'}</div>
+    <details class="card pad" id="del-log" style="margin-top:16px"><summary class="small">🗑️ ประวัติการลบห้อง</summary><div id="del-body" class="small muted" style="margin-top:10px">กำลังโหลด…</div></details>`;
   $('#new-t').onclick = openCreate;
+  $('#del-log').addEventListener('toggle', async ev => {
+    if (!ev.target.open || ev.target.dataset.loaded) return;
+    ev.target.dataset.loaded = '1';
+    try {
+      const rows = await api('GET', '/tournament-deletions');
+      $('#del-body').innerHTML = rows.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>เวลา</th><th>ห้อง</th><th class="hide-sm">สถานะตอนลบ</th><th>โดย / เหตุผล</th></tr></thead>
+        <tbody>${rows.map(d => `<tr>
+          <td style="white-space:nowrap">${fmtDate(d.deleted_at)}</td>
+          <td>#${d.code} ${esc(d.name || '')}<br><span class="muted">${FORMAT[d.format] || ''} · ${d.player_count ?? 0} คน · ${d.match_count ?? 0} แมตช์</span></td>
+          <td class="hide-sm">${(STATUS[d.status] || [d.status])[0]}${d.history_id ? '<br><span class="muted">ประวัติการแข่งยังอยู่</span>' : ''}</td>
+          <td>${esc(d.actor_name || '-')}${d.reason ? `<br><span class="muted">${esc(d.reason)}</span>` : ''}</td>
+        </tr>`).join('')}</tbody></table></div>` : 'ยังไม่เคยลบห้อง';
+    } catch (e) { $('#del-body').textContent = e.message; delete ev.target.dataset.loaded; }
+  });
 }
 
 function openCreate() {
@@ -511,6 +527,8 @@ function renderPlayers(el, v) {
         <div id="acc-results" class="search-results"></div>
         <div class="divider">หรือ walk-in (ไม่มีบัญชี ไม่ได้แต้ม/EXP)</div>
         <form class="row" id="walkin"><input name="n" placeholder="ชื่อผู้เล่น" required maxlength="80" style="flex:1;min-width:160px"><button class="btn secondary">เพิ่ม walk-in</button></form>
+        <div class="divider">หรือวางรายชื่อหลายคน (walk-in ทั้งหมด)</div>
+        <div class="row"><button class="btn secondary" id="bulk-open" type="button">📋 วางรายชื่อ (bulk add)</button><span class="small muted">ก๊อปคอลัมน์ชื่อจาก Google Sheet / Excel / แชท มาวางได้เลย</span></div>
       </div>` : ''}
       ${t.status === 'registration' ? `<div class="notice">ผู้เล่นสมัครเองได้จากปุ่มในบอร์ด Discord (<span class="code">!setup ${t.code}</span>) — รายชื่อจะขึ้นที่นี่อัตโนมัติ</div>` : ''}
       <div class="card table-wrap">
@@ -547,6 +565,8 @@ function renderPlayers(el, v) {
       }, 250);
     };
   }
+  const bo = $('#bulk-open');
+  if (bo) bo.onclick = () => openBulkAdd(v);
   const wi = $('#walkin');
   if (wi) wi.onsubmit = ev => {
     ev.preventDefault();
@@ -948,10 +968,82 @@ function renderFinish(el, v) {
   });
 }
 
+// ---------- bulk add: วางรายชื่อ ----------
+const NAME_MAX = 80;
+const normName = s => String(s).replace(/\s+/g, ' ').trim().toLowerCase();
+// แยกข้อความที่วางเป็นรายชื่อ: 1 บรรทัด = 1 คน (ก๊อปจากชีตได้), บรรทัดเดียวที่มีจุลภาค = แยกด้วย ,
+// ตัดเลขลำดับ "1." "1)" "1 -" bullet และ @ ออก · แถวที่ก๊อปมาหลายคอลัมน์ ใช้ช่องแรกที่ไม่ใช่ตัวเลขล้วน
+function parseNames(text) {
+  let lines = String(text || '').replace(/\r/g, '').split('\n');
+  if (lines.filter(l => l.trim()).length === 1 && !lines.join('').includes('\t') && lines.join('').includes(',')) lines = lines.join('').split(',');
+  const out = [];
+  for (const line of lines) {
+    const cells = line.split('\t').map(c => c.trim()).filter(c => c && !/^\d+[.)]?$/.test(c));
+    let name = (cells[0] || '')
+      .replace(/^(?:\s*(?:\d{1,4}\s*[.)\-:]\s+|\d{1,4}[.)]|[-*•·▪►]\s*|@))+/, '')
+      .replace(/\s+/g, ' ').trim();
+    if (!name) continue;
+    const long = name.length > NAME_MAX;
+    out.push({ name: name.slice(0, NAME_MAX), long });
+  }
+  return out;
+}
+function openBulkAdd(v) {
+  const t = v.tournament;
+  const inRoom = new Set(v.players.map(p => normName(p.display_name)));
+  openDialog(`
+    <h2>📋 วางรายชื่อผู้เล่น</h2>
+    <div class="small muted">1 บรรทัด = 1 คน · เพิ่มเป็น walk-in ทั้งหมด (ไม่ผูกบัญชี ไม่ได้แต้ม/EXP)${t.status === 'running' ? ' · เข้ากลางงาน: เริ่มจาก 0 ชนะ ในรอบถัดไป' : ''}</div>
+    <textarea name="names" rows="8" placeholder="ตัวอย่าง&#10;1. สมชาย&#10;2. Dino King&#10;@Oat" style="min-height:150px"></textarea>
+    <div id="bulk-preview" class="stack"></div>
+    <div class="dlg-actions"><button class="btn secondary" value="cancel">ยกเลิก</button><button class="btn" value="ok" id="bulk-ok" disabled>เพิ่ม</button></div>`,
+  async () => {
+    const list = parseNames($('#dialog-body textarea').value);
+    if (!list.length) { toast('ยังไม่มีรายชื่อ', true); return false; }
+    try {
+      const out = await api('POST', `/tournaments/${t.code}/players/bulk`, { names: list.map(x => x.name) });
+      toast(`เพิ่มผู้เล่น ${out.added} คนแล้ว`);
+    } catch (e) { toast(e.message, true); return false; }
+    await loadDetail(true);
+  });
+  const ta = $('#dialog-body textarea'), pv = $('#bulk-preview'), ok = $('#bulk-ok');
+  const draw = () => {
+    const list = parseNames(ta.value);
+    const seen = new Map();
+    list.forEach(x => seen.set(normName(x.name), (seen.get(normName(x.name)) || 0) + 1));
+    const dupRoom = list.filter(x => inRoom.has(normName(x.name))).length;
+    const dupList = list.filter(x => seen.get(normName(x.name)) > 1).length;
+    const long = list.filter(x => x.long).length;
+    ok.disabled = !list.length;
+    ok.textContent = list.length ? `เพิ่ม ${list.length} คน` : 'เพิ่ม';
+    if (!list.length) { pv.innerHTML = ''; return; }
+    const warn = [
+      dupRoom ? `${dupRoom} ชื่อซ้ำกับคนที่อยู่ในห้องแล้ว` : '',
+      dupList ? `${dupList} ชื่อซ้ำกันในลิสต์` : '',
+      long ? `${long} ชื่อยาวเกิน ${NAME_MAX} ตัวอักษร (ตัดให้แล้ว)` : '',
+    ].filter(Boolean);
+    pv.innerHTML = `
+      <div class="spread"><b>จะเพิ่ม ${list.length} คน</b><span class="small muted">ในห้องตอนนี้ ${v.players.length} คน → ${v.players.length + list.length}</span></div>
+      ${warn.length ? `<div class="notice warn small">⚠️ ${warn.join(' · ')} — ยังเพิ่มให้ทุกชื่อ ถ้าไม่ต้องการให้ลบบรรทัดนั้นออกก่อน</div>` : ''}
+      <div class="card table-wrap" style="max-height:240px;overflow:auto"><table>
+        <tbody>${list.map((x, i) => {
+          const tags = [
+            inRoom.has(normName(x.name)) ? '<span class="badge warn">ซ้ำในห้อง</span>' : '',
+            seen.get(normName(x.name)) > 1 ? '<span class="badge warn">ซ้ำในลิสต์</span>' : '',
+            x.long ? '<span class="badge warn">ตัดความยาว</span>' : '',
+          ].join(' ');
+          return `<tr><td class="num muted">${i + 1}</td><td>${esc(x.name)}</td><td style="text-align:right">${tags}</td></tr>`;
+        }).join('')}</tbody>
+      </table></div>`;
+  };
+  ta.oninput = draw;
+  ta.focus();
+}
+
 // ---------- log tab: บันทึกการแก้ไข ----------
 const AUDIT_LABEL = {
   edit_result: '✏️ แก้ผล', clear_result: '🧽 ล้างผล', rollback_round: '↩️ ย้อนรอบ',
-  reopen: '🔓 เปิดงานใหม่', reset: '🧹 รีเซ็ตผล',
+  reopen: '🔓 เปิดงานใหม่', reset: '🧹 รีเซ็ตผล', bulk_add: '📋 วางรายชื่อ',
 };
 function auditDetail(a, names) {
   const n = id => esc(names[id] || (id ? 'ผู้เล่นที่ลบไปแล้ว' : '—'));
@@ -968,6 +1060,7 @@ function auditDetail(a, names) {
     case 'rollback_round': return `รอบ ${b.current_round} → รอบ ${af.current_round} (ลบ ${(b.removed || []).filter(m => !m.is_bye).length} โต๊ะ)`;
     case 'reopen': return `ปิดจ็อบเมื่อ ${fmtDate(b.finished_at)} → กลับมาแข่งต่อ · หักสถิติคืน ${af.stats_reversed ?? 0} คน`;
     case 'reset': return `ลบ ${af.matches_deleted ?? 0} แมตช์ (เดิมอยู่รอบ ${b.current_round}) → เปิดรับสมัคร`;
+    case 'bulk_add': return `เพิ่ม walk-in ${af.count ?? 0} คน${(af.names || []).length ? `<br><span class="muted">${(af.names || []).map(esc).join(', ')}${(af.count ?? 0) > (af.names || []).length ? ' …' : ''}</span>` : ''}`;
     default: return '';
   }
 }
@@ -979,7 +1072,7 @@ async function renderLog(el, v) {
   const names = nameMap(v);
   el.innerHTML = `
     <div class="stack">
-      <div class="notice">บันทึกทุกการแก้ผลย้อนหลัง ล้างผล ย้อนรอบ เปิดงานใหม่ และรีเซ็ต — ใครทำ เมื่อไหร่ ค่าเดิม/ค่าใหม่ และเหตุผล</div>
+      <div class="notice">บันทึกทุกการแก้ผลย้อนหลัง ล้างผล ย้อนรอบ เปิดงานใหม่ รีเซ็ต และการวางรายชื่อ — ใครทำ เมื่อไหร่ ค่าเดิม/ค่าใหม่ และเหตุผล</div>
       <div class="card table-wrap"><table>
         <thead><tr><th>เวลา</th><th>ทำอะไร</th><th>รายละเอียด</th><th class="hide-sm">โดย</th></tr></thead>
         <tbody>${list.length ? list.map(a => `<tr>
@@ -1072,6 +1165,9 @@ function renderSettings(el, v) {
         <div class="small muted">ลบการจับคู่และผลทุกรอบ กลับไปสถานะเปิดรับสมัคร (รายชื่อผู้เล่นยังอยู่) แล้วกดเริ่มแข่งใหม่ได้${t.status === 'finished' ? ' · สถิติผู้เล่นที่บันทึกตอนปิดจะถูกหักคืน' : ''}${v.rewardsGiven ? '<br><b>แต้ม/EXP แจกไปแล้ว — จะไม่เปลี่ยนและไม่แจกซ้ำ</b>' : ''}</div>
         <button class="btn danger" id="reset-t">รีเซ็ตผลทั้งงาน</button></div>` : ''}
       ${locked ? '' : `<div class="card pad stack"><h2>ยกเลิกงาน</h2><div class="small muted">ไม่แจกรางวัลใดๆ และปิดงานนี้</div><button class="btn danger" id="cancel-t">ยกเลิกงานแข่ง</button></div>`}
+      <div class="card pad stack danger-zone"><h2>🗑️ ลบห้องนี้ถาวร</h2>
+        <div class="small muted">ลบห้อง รายชื่อ แมตช์ และบันทึกการแก้ไขของห้องนี้ทั้งหมด กู้คืนไม่ได้${t.status === 'finished' ? '<br>ห้องนี้ปิดจ็อบแล้ว: <b>ประวัติการแข่ง สถิติผู้เล่น และแต้ม/EXP ที่แจกไปจะยังอยู่ครบ</b> แต่จะเปิดงานใหม่ไม่ได้อีก' : ''}${t.setup_message_id || t.current_message_id ? '<br>บอร์ดใน Discord จะถูกแก้เป็น "ห้องนี้ถูกลบแล้ว" และเอาปุ่มออก' : ''}</div>
+        <button class="btn danger" id="delete-t">ลบห้องถาวร</button></div>
     </div>`;
   const rwf = $('#rw-form');
   if (rwf) {
@@ -1109,6 +1205,25 @@ function renderSettings(el, v) {
     S.tab = 'players'; S.round = null; S.finishChecks = null;
     const out = await act(() => api('POST', `/tournaments/${t.code}/reset`, { reason: f.get('reason') }), 'รีเซ็ตแล้ว — กลับไปเปิดรับสมัคร');
     if (!out) { S.tab = 'settings'; return false; }
+  });
+  const del = $('#delete-t');
+  if (del) del.onclick = () => openDialog(`
+    <h2>🗑️ ลบห้อง #${t.code} ถาวร?</h2>
+    <div class="muted"><b>${esc(t.name)}</b> · ${v.players.length} คน · ${v.matches.filter(m => !m.is_bye).length} แมตช์<br>
+      ลบแล้วกู้คืนไม่ได้ (เก็บสรุปไว้ใน "ประวัติการลบห้อง" ที่หน้ารายการงาน)
+      ${t.status === 'finished' ? '<br>ประวัติการแข่ง สถิติผู้เล่น และแต้ม/EXP จะไม่ถูกแตะ' : ''}
+      ${t.status === 'running' ? '<br><b>งานนี้กำลังแข่งอยู่</b>' : ''}</div>
+    <label class="field">พิมพ์ <span class="code">${t.code}</span> เพื่อยืนยัน<input name="confirm" required autocomplete="off" inputmode="numeric"></label>
+    <label class="field">เหตุผล (ไม่บังคับ)<input name="reason" maxlength="500" placeholder="เช่น สร้างห้องซ้ำ / ห้องทดสอบ"></label>
+    <div class="dlg-actions"><button class="btn secondary" value="cancel">ยกเลิก</button><button class="btn danger" value="ok">ลบถาวร</button></div>`,
+  async f => {
+    if (String(f.get('confirm')).trim() !== String(t.code)) { toast(`พิมพ์เลขงาน ${t.code} ให้ตรง`, true); return false; }
+    try {
+      await api('DELETE', `/tournaments/${t.code}`, { confirm_code: f.get('confirm'), reason: f.get('reason') });
+    } catch (e) { toast(e.message, true); return false; }
+    toast(`ลบห้อง #${t.code} แล้ว`);
+    S.code = null; S.view = null; S.lastJson = '';
+    location.hash = '#/';
   });
   const c = $('#cancel-t');
   if (c) c.onclick = async () => {
