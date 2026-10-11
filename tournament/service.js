@@ -279,6 +279,25 @@ async function addPlayer(idOrCode, input) {
     return p;
 }
 
+// เพิ่มหลายคนทีเดียว (วางรายชื่อ) — ตรรกะเดียวกับเพิ่มมือแบบ walk-in: ชื่ออย่างเดียว ไม่ผูกบัญชี
+// ชื่อซ้ำ (ในห้องหรือในลิสต์) ก็เพิ่มให้ตามที่สตาฟยืนยัน หน้าเว็บแค่เตือนในหน้าตรวจสอบ
+const BULK_MAX = 300;
+async function addPlayersBulk(idOrCode, { names } = {}, actor = null) {
+    const t = await getTournament(idOrCode);
+    const lateSwiss = t.status === 'running' && t.format === 'swiss';
+    if (t.status !== 'registration' && !lateSwiss) throw new ServiceError('ปิดรับสมัครแล้ว');
+    if (!Array.isArray(names)) throw new ServiceError('ไม่มีรายชื่อ');
+    const list = names.map(n => clean(n)).filter(Boolean);
+    if (!list.length) throw new ServiceError('ไม่มีรายชื่อให้เพิ่ม');
+    if (list.length > BULK_MAX) throw new ServiceError(`เพิ่มได้ครั้งละไม่เกิน ${BULK_MAX} คน (ส่งมา ${list.length})`);
+
+    const rows = list.map(display_name => ({ tournament_id: t.id, customer_id: null, discord_id: null, display_name }));
+    const inserted = await run(db().from('tournament_players').insert(rows).select());
+    await audit(t, { action: 'bulk_add', actor, after: { count: inserted.length, names: list.slice(0, 100) } });
+    events.emit('players', t);
+    return { added: inserted.length, players: inserted };
+}
+
 async function removePlayer(idOrCode, playerId) {
     const t = await getTournament(idOrCode);
     if (t.status !== 'registration') throw new ServiceError('เริ่มแข่งแล้ว ลบผู้เล่นไม่ได้ ให้ใช้ "ถอนตัว" แทน');
@@ -589,6 +608,40 @@ async function resetTournament(idOrCode, { reason } = {}, actor = null) {
 }
 
 // ---------------------------------------------------------
+// ลบห้องถาวร (กู้คืนไม่ได้)
+// - matches / players / tournament_audit ของห้องหายตาม cascade
+// - ห้องที่ปิดจ็อบแล้ว: ไม่ถอยสถิติผู้เล่น, ไม่ลบ tournament_history, ไม่แตะแต้ม/EXP
+// - เก็บสรุปไว้ใน tournament_deletions ก่อนลบ
+// ---------------------------------------------------------
+async function deleteTournament(idOrCode, { confirm_code, reason } = {}, actor = null) {
+    const full = await getFull(idOrCode);
+    const t = full.tournament;
+    if (String(confirm_code ?? '').trim().replace(/^#/, '') !== String(t.code)) {
+        throw new ServiceError(`พิมพ์รหัสงาน (${t.code}) ให้ตรงเพื่อยืนยันการลบ`);
+    }
+    await run(db().from('tournament_deletions').insert({
+        tournament_id: t.id, code: t.code, name: t.name, status: t.status, format: t.format,
+        player_count: full.players.length, match_count: full.matches.length, history_id: t.history_id || null,
+        reason: clean(reason, 500) || null, actor_id: actor?.id || null, actor_name: actor?.name || null,
+        snapshot: {
+            tournament: t,
+            players: full.players.map(p => ({ id: p.id, name: p.display_name, discord_id: p.discord_id, customer_id: p.customer_id, final_rank: p.final_rank, dropped: !!p.dropped_at })),
+            matches: full.matches.map(matchSnap),
+        },
+    }));
+    const gone = await run(db().from('tournaments').delete().eq('id', t.id).select('id'));
+    if (!gone.length) throw new ServiceError('ไม่พบงานนี้ (อาจถูกลบไปแล้ว)', 404);
+    events.emit('deleted', t);
+    return { deleted: true, code: t.code, name: t.name };
+}
+
+async function listDeletions({ limit = 50 } = {}) {
+    return run(db().from('tournament_deletions')
+        .select('id, tournament_id, code, name, status, format, player_count, match_count, history_id, reason, actor_name, deleted_at')
+        .order('deleted_at', { ascending: false }).limit(Math.min(Number(limit) || 50, 200)));
+}
+
+// ---------------------------------------------------------
 // จับเวลา
 // ---------------------------------------------------------
 async function startTimer(idOrCode, minutes) {
@@ -770,7 +823,8 @@ module.exports = {
     ServiceError, events, db,
     getTournament, getFull, view, buildView, listTournaments,
     createTournament, updateTournament, cancelTournament, setDiscordRefs,
-    findAccountByDiscord, searchAccounts, addPlayer, removePlayer, removePlayerByDiscord, setDropped, renamePlayer,
+    deleteTournament, listDeletions,
+    findAccountByDiscord, searchAccounts, addPlayer, addPlayersBulk, removePlayer, removePlayerByDiscord, setDropped, renamePlayer,
     startTournament, nextRound, reportResult, clearResult, startTimer, stopTimer,
     rollbackRound, reopenTournament, resetTournament, listAudit,
     awardPoints, awardExp, finish, expAwarded,
