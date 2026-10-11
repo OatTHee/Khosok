@@ -85,9 +85,13 @@ function buildRouter() {
     r.get('/tournaments/:id', wrap(req => S.view(req.params.id)));
     r.patch('/tournaments/:id', wrap(req => S.updateTournament(req.params.id, req.body || {})));
     r.post('/tournaments/:id/cancel', wrap(req => S.cancelTournament(req.params.id)));
+    // 🗑️ ลบห้องถาวร (ต้องพิมพ์รหัสงานยืนยัน) + ประวัติการลบ
+    r.delete('/tournaments/:id', wrap(req => S.deleteTournament(req.params.id, req.body || {}, actorOf(req))));
+    r.get('/tournament-deletions', wrap(() => S.listDeletions()));
 
     r.get('/accounts', wrap(req => S.searchAccounts(req.query.q)));
     r.post('/tournaments/:id/players', wrap(req => S.addPlayer(req.params.id, req.body || {})));
+    r.post('/tournaments/:id/players/bulk', wrap(req => S.addPlayersBulk(req.params.id, req.body || {}, actorOf(req))));
     r.delete('/tournaments/:id/players/:pid', wrap(req => S.removePlayer(req.params.id, req.params.pid)));
     r.post('/tournaments/:id/players/:pid/drop', wrap(req => S.setDropped(req.params.id, req.params.pid, req.body?.dropped !== false)));
     r.post('/tournaments/:id/players/:pid/rename', wrap(req => S.renamePlayer(req.params.id, req.params.pid, req.body?.name)));
