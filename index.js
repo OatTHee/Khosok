@@ -457,6 +457,20 @@ T.events.on('round', safeAsync(async (t, round) => {
 }));
 T.events.on('match', safeAsync(async t => { await refreshCurrentBoard(await T.getTournament(t.id)); }));
 T.events.on('timer', safeAsync(async t => { await refreshCurrentBoard(t); }));
+// ห้องถูกลบจากเว็บ: แก้แบนเนอร์เดิมเป็น "ห้องนี้ถูกลบแล้ว" + เอาปุ่มออก (ไม่ส่งข้อความใหม่)
+T.events.on('deleted', safeAsync(async t => {
+    const channel = await fetchBoardChannel(t);
+    if (!channel) return;
+    const embed = new EmbedBuilder()
+        .setColor(0x6b7280)
+        .setTitle(`🗑️ ห้องนี้ถูกลบแล้ว`)
+        .setDescription(`งาน **${t.name}** (รหัส ${t.code}) ถูกลบโดยทีมงาน ปุ่มต่างๆ ใช้งานไม่ได้แล้ว`);
+    for (const id of [t.setup_message_id, t.current_message_id]) {
+        if (!id) continue;
+        const msg = await channel.messages.fetch(id).catch(() => null);
+        if (msg) await msg.edit({ content: '', embeds: [embed], components: [], attachments: [] }).catch(() => {});
+    }
+}));
 T.events.on('finished', safeAsync(async t => {
     const fresh = await T.getTournament(t.id);
     await refreshCurrentBoard(fresh);
